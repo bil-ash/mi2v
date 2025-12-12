@@ -16,7 +16,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
-sys.path.insert(0, "/data/shuaizhang/MobileI2V")
+sys.path.insert(0, ".")
 
 import datetime
 import getpass

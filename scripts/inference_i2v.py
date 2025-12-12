@@ -35,7 +35,7 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")  # ignore warning
 
 import sys
-sys.path.insert(0, "/data/shuaizhang/MobileI2V")
+sys.path.insert(0, ".")
 
 
 from diffusion import DPMS, FlowEuler, SASolverSampler
