@@ -1,5 +1,5 @@
 data:
-  data_path: [/data/shuaizhang/MobileI2V/data.csv]
+  data_path: [./data.csv]
   image_height: 720
   image_width: 1280
   transform_name: resize_crop
@@ -13,7 +13,7 @@ model:
   image_width: 1280
   mixed_precision: fp16
   fp32_attention: true
-  load_from: /data/shuaizhang/MobileI2V/model/hybrid_371.pth
+  load_from: ./model/hybrid_371.pth
   resume_from:
   aspect_ratio_type: ASPECT_RATIO_512
   multi_scale: false
@@ -31,14 +31,14 @@ model:
 # VAE setting
 vae:
   vae_type: video-vae
-  vae_pretrained: /data/shuaizhang/Sana/model/video-vae
+  vae_pretrained: ./model/video-vae
   scale_factor: 0.41407
   vae_latent_dim: 128
   vae_downsample_rate: 32
   sample_posterior: true
 # text encoder
 text_encoder:
-  text_encoder_name: /data/shuaizhang/Sana/model/Qwen2-0.5B
+  text_encoder_name: ./model/Qwen2-0.5B
   y_norm: true
   y_norm_scale_factor: 0.01
   model_max_length: 300
