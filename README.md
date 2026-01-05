@@ -90,6 +90,9 @@ To achieve faster VAE decoder speeds, we replaced the LTX-Video decoder with the
 
 ### Metrics
 Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/blob/main/evaluate_FVD.py).
+```
+python scripts/evaluate_FVD.py -dir1 path/gts -dir2 path/videos -b 1 -r 32 -n 128 -ns 16 -i3d ./i3d_torchscript.pt
+```
 
 ## 🎯 Mobile Demo
 We designed the mobile UI and deployed the model, as shown in the video below:
