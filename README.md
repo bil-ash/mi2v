@@ -88,6 +88,8 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_i2v.py \
 ```
 To achieve faster VAE decoder speeds, we replaced the LTX-Video decoder with the [Turbo-VAED](https://github.com/hustvl/Turbo-VAED) decoder.
 
+### Metrics
+Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/blob/main/evaluate_FVD.py).
 
 ## 🎯 Mobile Demo
 We designed the mobile UI and deployed the model, as shown in the video below:
