@@ -89,7 +89,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_i2v.py \
 To achieve faster VAE decoder speeds, we replaced the LTX-Video decoder with the [Turbo-VAED](https://github.com/hustvl/Turbo-VAED) decoder.
 
 ### Metrics
-Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/blob/main/evaluate_FVD.py).
+Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/tree/main).
 ```
 python scripts/evaluate_FVD.py -dir1 path/gts -dir2 path/videos -b 1 -r 32 -n 128 -ns 16 -i3d ./i3d_torchscript.pt
 ```
