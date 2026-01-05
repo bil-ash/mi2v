@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--nframes", type=int, default=128)
     parser.add_argument("-ns", "--nsamples", type=int, default=2048)
 
-    parser.add_argument("-i3d", "--i3d", type=str, default=2048)
+    parser.add_argument("-i3d", "--i3d", type=str)
     opt = parser.parse_args()
 
     device = "cuda:0"
@@ -202,7 +202,7 @@ if __name__ == "__main__":
 
     feats_fake = []
     for i in tqdm(range(nsamples // batch_size)):
-        video = next(gt_dataset_iter).to(device)  # b,n,h,w,c => b,c,n,h,w
+        video = next(pred_dataset_iter).to(device)  # b,n,h,w,c => b,c,n,h,w
         video = video.permute(0, 4, 1, 2, 3).contiguous()
         with torch.no_grad():
             micro_feats_real = (
