@@ -1,0 +1,1559 @@
+# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Modified from OpenAI's diffusion repos
+#     GLIDE: https://github.com/openai/glide-text2im/blob/main/glide_text2im/gaussian_diffusion.py
+#     ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
+#     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+
+import os
+import sys
+sys.path.append("/data/vepfs/users/shuaizhang/MobileI2V_distill")
+from diffusion.model.addistill.loss import gan_loss
+from diffusion.model.tbutils import huber_loss, gaussian_mixture
+from diffusers import FlowMatchEulerDiscreteScheduler
+
+import enum
+import math
+
+import numpy as np
+import torch as th
+import torch.nn.functional as F
+from PIL import Image
+from diffusion.model.builder import vae_decode
+
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
+
+
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+
+class ModelMeanType(enum.Enum):
+    """
+    Which type of output the model predicts.
+    """
+
+    PREVIOUS_X = enum.auto()  # the model predicts x_{t-1}
+    START_X = enum.auto()  # the model predicts x_0
+    EPSILON = enum.auto()  # the model predicts epsilon
+    VELOCITY = enum.auto()  # the model predicts velocity
+
+
+class ModelVarType(enum.Enum):
+    """
+    What is used as the model's output variance.
+    The LEARNED_RANGE option has been added to allow the model to predict
+    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
+    """
+
+    LEARNED = enum.auto()
+    FIXED_SMALL = enum.auto()
+    FIXED_LARGE = enum.auto()
+    LEARNED_RANGE = enum.auto()
+
+
+class LossType(enum.Enum):
+    MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
+    RESCALED_MSE = enum.auto()  # use raw MSE loss (with RESCALED_KL when learning variances)
+    KL = enum.auto()  # use the variational lower-bound
+    RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
+
+    def is_vb(self):
+        return self == LossType.KL or self == LossType.RESCALED_KL
+
+
+def _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, warmup_frac):
+    betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
+    warmup_time = int(num_diffusion_timesteps * warmup_frac)
+    betas[:warmup_time] = np.linspace(beta_start, beta_end, warmup_time, dtype=np.float64)
+    return betas
+
+
+def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
+    """
+    This is the deprecated API for creating beta schedules.
+    See get_named_beta_schedule() for the new library of schedules.
+    """
+    if beta_schedule == "quad":
+        betas = (
+            np.linspace(
+                beta_start**0.5,
+                beta_end**0.5,
+                num_diffusion_timesteps,
+                dtype=np.float64,
+            )
+            ** 2
+        )
+    elif beta_schedule == "linear":
+        betas = np.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64)
+    elif beta_schedule == "warmup10":
+        betas = _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, 0.1)
+    elif beta_schedule == "warmup50":
+        betas = _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, 0.5)
+    elif beta_schedule == "const":
+        betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
+    elif beta_schedule == "jsd":  # 1/T, 1/(T-1), 1/(T-2), ..., 1
+        betas = 1.0 / np.linspace(num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64)
+    else:
+        raise NotImplementedError(beta_schedule)
+    assert betas.shape == (num_diffusion_timesteps,)
+    return betas
+
+
+def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
+    """
+    Get a pre-defined beta schedule for the given name.
+    The beta schedule library consists of beta schedules which remain similar
+    in the limit of num_diffusion_timesteps.
+    Beta schedules may be added, but should not be removed or changed once
+    they are committed to maintain backwards compatibility.
+    """
+    if schedule_name == "linear":
+        # Linear schedule from Ho et al, extended to work for any number of
+        # diffusion steps.
+        scale = 1000 / num_diffusion_timesteps
+        return get_beta_schedule(
+            "linear",
+            beta_start=scale * 0.0001,
+            beta_end=scale * 0.02,
+            num_diffusion_timesteps=num_diffusion_timesteps,
+        )
+    elif schedule_name == "squaredcos_cap_v2":
+        return betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+        )
+    elif schedule_name == "linear_flow":
+        scale = 1000 / num_diffusion_timesteps
+        return get_beta_schedule(
+            "linear",
+            beta_start=scale * 1.0,
+            beta_end=scale * 0.001,
+            num_diffusion_timesteps=num_diffusion_timesteps,
+        )
+    else:
+        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
+
+def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
+    """
+    Create a beta schedule that discretizes the given alpha_t_bar function,
+    which defines the cumulative product of (1-beta) over time from t = [0,1].
+    :param num_diffusion_timesteps: the number of betas to produce.
+    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+                      produces the cumulative product of (1-beta) up to that
+                      part of the diffusion process.
+    :param max_beta: the maximum beta to use; use values lower than 1 to
+                     prevent singularities.
+    """
+    betas = []
+    for i in range(num_diffusion_timesteps):
+        t1 = i / num_diffusion_timesteps
+        t2 = (i + 1) / num_diffusion_timesteps
+        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    return np.array(betas)
+
+
+class GaussianDiffusion:
+    """
+    Utilities for training and sampling diffusion models.
+    Original ported from this codebase:
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py#L42
+    :param betas: a 1-D numpy array of betas for each diffusion timestep,
+                  starting at T and going to 1.
+    """
+
+    def __init__(
+        self,
+        *,
+        betas,
+        model_mean_type,
+        model_var_type,
+        loss_type,
+        snr=False,
+        return_startx=False,
+        flow=False,
+        sigmas=None,
+    ):
+
+        self.model_mean_type = model_mean_type
+        self.model_var_type = model_var_type
+        self.loss_type = loss_type
+        self.snr = snr
+        self.return_startx = return_startx
+        self.flow = flow
+
+        # Use float64 for accuracy.
+        betas = np.array(betas, dtype=np.float64)
+        self.betas = betas
+        self.sigmas = 1.0 - betas if sigmas is None else sigmas
+        self.one_minus_sigmas = 1.0 - self.sigmas
+        assert len(betas.shape) == 1, "betas must be 1-D"
+        assert (betas > 0).all() and (betas <= 1).all()
+
+        self.num_timesteps = int(betas.shape[0])
+        print("num_timesteps:", self.num_timesteps)
+
+        alphas = 1.0 - betas
+        self.alphas = alphas
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+
+        if False:
+            target_resolution = 128  # 1024:128; 512:64; 256:32;
+            reference_resolution = 64  # Reference resolution (e.g., 64x64)
+            scaling_factor = (target_resolution / reference_resolution) ** 2
+            print("scaling_factor", scaling_factor)
+
+            # Adjust alphas and betas according to the scaling factor
+            alpha_cumprod_snr_shift = self.alphas_cumprod / (
+                scaling_factor * (1 - self.alphas_cumprod) + self.alphas_cumprod
+            )
+            alpha_cuspord_rmove1 = np.concatenate([np.ones([1]), alpha_cumprod_snr_shift[:999]])
+            alpha_snr_shift = alpha_cumprod_snr_shift / alpha_cuspord_rmove1
+
+            betas_snr_shift = 1 - alpha_snr_shift
+
+            # Update the class attributes with adjusted values
+            snr_ref = self.alphas_cumprod / (1 - self.alphas_cumprod)
+            snr_cur = alpha_cumprod_snr_shift / (1 - alpha_cumprod_snr_shift)
+
+            self.betas = betas_snr_shift
+            self.alphas_cumprod = np.cumprod(alpha_snr_shift, axis=0)
+
+        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
+        assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.posterior_variance = betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.posterior_log_variance_clipped = (
+            np.log(np.append(self.posterior_variance[1], self.posterior_variance[1:]))
+            if len(self.posterior_variance) > 1
+            else np.array([])
+        )
+
+        self.posterior_mean_coef1 = betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
+
+        # by myself
+        # self.iter_steps = 10000
+        self.iter_steps = 0
+        self.teacher_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=self.num_timesteps, shift=3.0)
+        self.mixture_num_components = [4, 4, 4, 4]
+        self.mode_probs = [
+            [0.0, 0.0, 0.5, 0.5],
+            [0.1, 0.3, 0.3, 0.3],
+            [0.25, 0.25, 0.25, 0.25],
+            [0.4, 0.2, 0.2, 0.2],
+        ]
+        # self.mode_probs = [
+        #     [0.25, 0.25, 0.25, 0.25],
+        #     [0.25, 0.25, 0.25, 0.25],
+        #     [0.25, 0.25, 0.25, 0.25],
+        #     [0.25, 0.25, 0.25, 0.25],
+        # ]
+        self.mixture_var = [0.5, 0.5, 0.5, 0.5]
+        self.K = [16, 16, 16, 16]
+        # self.num_iterations_per_K = [8000, 8000, 8000, 8000]
+        self.num_iterations_per_K = [4000, 4000, 4000, 4000]
+        self.K_steps = np.cumsum(self.num_iterations_per_K)
+        # self.betas_aux = np.linspace(0.0001, 0.02, 1000, dtype=np.float64)
+        # self.alphas_aux = 1.0 - self.betas_aux  
+        # self.alpha_cumprod_aux = np.cumprod(self.alphas_aux)
+        # self.one_minus_sigmas_cumprod = np.cumprod(self.one_minus_sigmas[::2])
+
+    def q_mean_variance(self, x_start, t):
+        """
+        Get the distribution q(x_t | x_0).
+        :param x_start: the [N x C x ...] tensor of noiseless inputs.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+        """
+        mean = _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
+        log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        return mean, variance, log_variance
+
+    def q_sample(self, x_start, t, noise=None):
+        """
+        Diffuse the data for a given number of diffusion steps.
+        In other words, sample from q(x_t | x_0).
+        :param x_start: the initial data batch.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise: if specified, the split-out normal noise.
+        :return: A noisy version of x_start.
+        """
+        if noise is None:
+            noise = th.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        if self.flow:
+            return (
+                _extract_into_tensor(self.one_minus_sigmas, t, x_start.shape) * x_start
+                + _extract_into_tensor(self.sigmas, t, x_start.shape) * noise
+            )
+        else:
+            return (
+                _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+                + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            )
+
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        """
+        Compute the mean and variance of the diffusion posterior:
+            q(x_{t-1} | x_t, x_0)
+        """
+        assert x_start.shape == x_t.shape
+        posterior_mean = (
+            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = _extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
+        assert (
+            posterior_mean.shape[0]
+            == posterior_variance.shape[0]
+            == posterior_log_variance_clipped.shape[0]
+            == x_start.shape[0]
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+        """
+        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
+        the initial x, x_0.
+        :param model: the model, which takes a signal and a batch of timesteps
+                      as input.
+        :param x: the [N x C x ...] tensor at time t.
+        :param t: a 1-D Tensor of timesteps.
+        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample. Applies before
+            clip_denoised.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict with the following keys:
+                 - 'mean': the model mean output.
+                 - 'variance': the model variance output.
+                 - 'log_variance': the log of 'variance'.
+                 - 'pred_xstart': the prediction for x_0.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        B, C = x.shape[:2]
+        assert t.shape == (B,)
+        model_output = model(x, t, **model_kwargs)
+        if isinstance(model_output, tuple):
+            model_output, extra = model_output
+        else:
+            extra = None
+
+        if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+            assert model_output.shape == (B, C * 2, *x.shape[2:])
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            # The model_var_values is [-1, 1] for [min_var, max_var].
+            frac = (model_var_values + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
+        elif self.model_var_type in [ModelVarType.FIXED_LARGE, ModelVarType.FIXED_SMALL]:
+            model_variance, model_log_variance = {
+                # for fixedlarge, we set the initial (log-)variance like so
+                # to get a better decoder log likelihood.
+                ModelVarType.FIXED_LARGE: (
+                    np.append(self.posterior_variance[1], self.betas[1:]),
+                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
+                ),
+                ModelVarType.FIXED_SMALL: (
+                    self.posterior_variance,
+                    self.posterior_log_variance_clipped,
+                ),
+            }[self.model_var_type]
+            model_variance = _extract_into_tensor(model_variance, t, x.shape)
+            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
+        else:
+            model_variance = th.zeros_like(model_output)
+            model_log_variance = th.zeros_like(model_output)
+
+        def process_xstart(x):
+            if denoised_fn is not None:
+                x = denoised_fn(x)
+            if clip_denoised:
+                return x.clamp(-1, 1)
+            return x
+
+        if self.model_mean_type == ModelMeanType.START_X:
+            pred_xstart = process_xstart(model_output)
+        else:
+            pred_xstart = process_xstart(self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output))
+        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
+
+        assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
+            "extra": extra,
+        }
+
+    def _predict_xstart_from_eps(self, x_t, t, eps):
+        assert x_t.shape == eps.shape
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+        )
+
+    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart
+        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+
+    def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
+        """
+        Compute the mean for the previous step, given a function cond_fn that
+        computes the gradient of a conditional log probability with respect to
+        x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
+        condition on y.
+        This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
+        """
+        gradient = cond_fn(x, t, **model_kwargs)
+        new_mean = p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
+        return new_mean
+
+    def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
+        """
+        Compute what the p_mean_variance output would have been, should the
+        model's score function be conditioned by cond_fn.
+        See condition_mean() for details on cond_fn.
+        Unlike condition_mean(), this instead uses the conditioning strategy
+        from Song et al (2020).
+        """
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+
+        eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
+        eps = eps - (1 - alpha_bar).sqrt() * cond_fn(x, t, **model_kwargs)
+
+        out = p_mean_var.copy()
+        out["pred_xstart"] = self._predict_xstart_from_eps(x, t, eps)
+        out["mean"], _, _ = self.q_posterior_mean_variance(x_start=out["pred_xstart"], x_t=x, t=t)
+        return out
+
+    def p_sample(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+    ):
+        """
+        Sample x_{t-1} from the model at the given timestep.
+        :param model: the model to sample from.
+        :param x: the current tensor at x_{t-1}.
+        :param t: the value of t, starting at 0 for the first diffusion step.
+        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample.
+        :param cond_fn: if not None, this is a gradient function that acts
+                        similarly to the model.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict containing the following keys:
+                 - 'sample': a random sample from the model.
+                 - 'pred_xstart': a prediction of x_0.
+        """
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+        noise = th.randn_like(x)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))  # no noise when t == 0
+        if cond_fn is not None:
+            out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+    def p_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Generate samples from the model.
+        :param model: the model module.
+        :param shape: the shape of the samples, (N, C, H, W).
+        :param noise: if specified, the noise from the encoder to sample.
+                      Should be of the same shape as `shape`.
+        :param clip_denoised: if True, clip x_start predictions to [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample.
+        :param cond_fn: if not None, this is a gradient function that acts
+                        similarly to the model.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param device: if specified, the device to create the samples on.
+                       If not specified, use a model parameter's device.
+        :param progress: if True, show a tqdm progress bar.
+        :return: a non-differentiable batch of samples.
+        """
+        final = None
+        for sample in self.p_sample_loop_progressive(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+        ):
+            final = sample
+        return final["sample"]
+
+    def p_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Generate samples from the model and yield intermediate samples from
+        each timestep of diffusion.
+        Arguments are the same as p_sample_loop().
+        Returns a generator over dicts, where each dict is the return value of
+        p_sample().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.p_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                )
+                yield out
+                img = out["sample"]
+
+    def ddim_sample(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """
+        Sample x_{t-1} from the model using DDIM.
+        Same usage as p_sample().
+        """
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+        if cond_fn is not None:
+            out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
+
+        # Usually our model outputs epsilon, but we re-derive it
+        # in case we used x_start or x_prev prediction.
+        eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
+
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        sigma = eta * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar)) * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+        # Equation 12.
+        noise = th.randn_like(x)
+        mean_pred = out["pred_xstart"] * th.sqrt(alpha_bar_prev) + th.sqrt(1 - alpha_bar_prev - sigma**2) * eps
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))  # no noise when t == 0
+        sample = mean_pred + nonzero_mask * sigma * noise
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+    def ddim_reverse_sample(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """
+        Sample x_{t+1} from the model using DDIM reverse ODE.
+        """
+        assert eta == 0.0, "Reverse ODE only for deterministic path"
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+        if cond_fn is not None:
+            out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
+        # Usually our model outputs epsilon, but we re-derive it
+        # in case we used x_start or x_prev prediction.
+        eps = (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x - out["pred_xstart"]
+        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
+        alpha_bar_next = _extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
+
+        # Equation 12. reversed
+        mean_pred = out["pred_xstart"] * th.sqrt(alpha_bar_next) + th.sqrt(1 - alpha_bar_next) * eps
+
+        return {"sample": mean_pred, "pred_xstart": out["pred_xstart"]}
+
+    def ddim_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+    ):
+        """
+        Generate samples from the model using DDIM.
+        Same usage as p_sample_loop().
+        """
+        final = None
+        for sample in self.ddim_sample_loop_progressive(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+            eta=eta,
+        ):
+            final = sample
+        return final["sample"]
+
+    def ddim_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+    ):
+        """
+        Use DDIM to sample from the model and yield intermediate samples from
+        each timestep of DDIM.
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.ddim_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                    eta=eta,
+                )
+                yield out
+                img = out["sample"]
+
+    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
+        """
+        Get a term for the variational lower-bound.
+        The resulting units are bits (rather than nats, as one might expect).
+        This allows for comparison to other papers.
+        :return: a dict with the following keys:
+                 - 'output': a shape [N] tensor of NLLs or KLs.
+                 - 'pred_xstart': the x_0 predictions.
+        """
+        true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)
+        out = self.p_mean_variance(model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
+        kl = normal_kl(true_mean, true_log_variance_clipped, out["mean"], out["log_variance"])
+        kl = mean_flat(kl) / np.log(2.0)
+
+        decoder_nll = -discretized_gaussian_log_likelihood(
+            x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
+        )
+        assert decoder_nll.shape == x_start.shape
+        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+
+        # At the first timestep return the decoder NLL,
+        # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
+        output = th.where((t == 0), decoder_nll, kl)
+        return {"output": output, "pred_xstart": out["pred_xstart"]}
+
+    def training_losses(self, model, x_start, timestep, model_kwargs=None, noise=None, skip_noise=False):
+        """
+        Compute training losses for a single timestep.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param t: a batch of timestep indices.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param noise: if specified, the specific Gaussian noise to try to remove.
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+                 Some mean or variance settings may also have other keys.
+        """
+        t = timestep
+        if model_kwargs is None:
+            model_kwargs = {}
+        if skip_noise:
+            x_t = x_start
+        else:
+            if noise is None:
+                noise = th.randn_like(x_start)
+            x_t = self.q_sample(x_start, t, noise=noise)
+
+        terms = {}
+
+        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            terms["loss"] = self._vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+            )["output"]
+            if self.loss_type == LossType.RESCALED_KL:
+                terms["loss"] *= self.num_timesteps
+        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            model_output = model(x_t, t, **model_kwargs)
+            if isinstance(model_output, dict) and model_output.get("x", None) is not None:
+                output = model_output["x"]
+            else:
+                output = model_output
+
+            if self.return_startx and self.model_mean_type == ModelMeanType.EPSILON:
+                B, C = x_t.shape[:2]
+                assert output.shape == (B, C * 2, *x_t.shape[2:])
+                output = th.split(output, C, dim=1)[0]
+                return output, self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output), x_t
+
+            if self.model_var_type in [
+                ModelVarType.LEARNED,
+                ModelVarType.LEARNED_RANGE,
+            ]:
+                B, C = x_t.shape[:2]
+                assert output.shape == (B, C * 2, *x_t.shape[2:])
+                output, model_var_values = th.split(output, C, dim=1)
+                # Learn the variance using the variational bound, but don't let it affect our mean prediction.
+                frozen_out = th.cat([output.detach(), model_var_values], dim=1)
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out, **kwargs: r,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+                if self.loss_type == LossType.RESCALED_MSE:
+                    # Divide by 1000 for equivalence with initial implementation.
+                    # Without a factor of 1/1000, the VB term hurts the MSE term.
+                    terms["vb"] *= self.num_timesteps / 1000.0
+
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+                ModelMeanType.VELOCITY: noise - x_start,
+            }[self.model_mean_type]
+            assert output.shape == target.shape == x_start.shape
+            if self.snr:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_noise = self._predict_eps_from_xstart(x_t=x_t, t=t, pred_xstart=output)
+                    pred_startx = output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_noise = output
+                    pred_startx = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output)
+                # terms["mse_eps"] = mean_flat((noise - pred_noise) ** 2)
+                # terms["mse_x0"] = mean_flat((x_start - pred_startx) ** 2)
+
+                t = t[:, None, None, None].expand(pred_startx.shape)  # [128, 4, 32, 32]
+                # best
+                target = th.where(t > 249, noise, x_start)
+                output = th.where(t > 249, pred_noise, pred_startx)
+            loss = (target - output) ** 2
+            if model_kwargs.get("mask_ratio", False) and model_kwargs["mask_ratio"] > 0:
+                assert "mask" in model_output
+                loss = F.avg_pool2d(loss.mean(dim=1), model.model.module.patch_size).flatten(1)
+                mask = model_output["mask"]
+                unmask = 1 - mask
+                terms["mse"] = mean_flat(loss * unmask) * unmask.shape[1] / unmask.sum(1)
+                if model_kwargs["mask_loss_coef"] > 0:
+                    terms["mae"] = model_kwargs["mask_loss_coef"] * mean_flat(loss * mask) * mask.shape[1] / mask.sum(1)
+            else:
+                terms["mse"] = mean_flat(loss)
+            if "vb" in terms:
+                terms["loss"] = terms["mse"] + terms["vb"]
+            else:
+                terms["loss"] = terms["mse"]
+            if "mae" in terms:
+                terms["loss"] = terms["loss"] + terms["mae"]
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        return terms
+
+    def consistency_losses(self, model, teacher_model, target_model, x_start, timestep, train_sampling_steps, null_y, infer_mask, model_kwargs=None, noise=None, skip_noise=False, vae=None, lpips=None):
+        """
+        Compute training losses for a single timestep.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param t: a batch of timestep indices.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param noise: if specified, the specific Gaussian noise to try to remove.
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+                 Some mean or variance settings may also have other keys.
+        """
+        # num_segments = 2
+        boundary = 1.0
+        # boundary = 0
+        reduce_op = th.mean
+        shape = x_start.shape
+        space = int(1000 / train_sampling_steps)
+        # delta = 1e-3
+        # delta = 2e-2
+        delta = space / 1000
+
+        t = timestep
+        # r = th.clamp(t + int(delta * train_sampling_steps), max=train_sampling_steps - 1)
+        r = th.clamp(t - int(delta * train_sampling_steps), min=0)
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        if skip_noise:
+            x_t = x_start
+        else:
+            if noise is None:
+                noise = th.randn_like(x_start)
+            x_t = self.q_sample(x_start, space*t, noise=noise)
+
+        t_expand = t.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
+        r_expand = r.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
+
+        # segments = th.linspace(0, train_sampling_steps, num_segments + 1, device=x_start.device)
+        # segments = th.tensor([0, 499, 999], device=x_start.device)
+        # segments = th.tensor([0, 49], device=x_start.device)
+    
+        # seg_indices = th.searchsorted(segments, t, side="left").clamp(min=1) # .clamp(min=1) prevents the inclusion of 0 in indices.
+        # seg_indices = th.searchsorted(segments, t, side="left").clamp(min=1) - 1
+        # segment_ends = segments[seg_indices]
+        # segment_ends_expand = segment_ends.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
+
+        # x_at_segment_ends = self.q_sample(x_start, space*segment_ends.to(dtype=th.int), noise=noise)
+        # x_at_segment_ends = []
+        # for segment_end in segment_ends:
+        #     x_at_segment_ends.append(self.q_sample(x_start, th.int(segment_end), noise=noise))
+        # x_at_segment_ends = th.stack(x_at_segment_ends, dim=0)
+
+        # def f_euler(t, segment_ends, xt, vt, train_sampling_steps):
+        #     return xt + ((segment_ends - t) / train_sampling_steps) * vt
+        def f_euler(t, xt, vt, train_sampling_steps):
+            return xt - (t / train_sampling_steps) * vt
+        
+        # def threshold_based_f_euler(t, segment_ends, xt, vt, threshold, x_at_segment_ends, train_sampling_steps):
+        #     if (threshold, int) and threshold == 0:
+        #         return x_at_segment_ends
+            
+        #     # less_than_threshold = t < threshold * train_sampling_steps
+        #     more_than_threshold = t > (1 - threshold) * train_sampling_steps
+            
+        #     # res = (
+        #     #     less_than_threshold * f_euler(t, segment_ends, xt, vt, train_sampling_steps)
+        #     #     + (~less_than_threshold) * x_at_segment_ends
+        #     #     )
+        #     res = (
+        #         more_than_threshold * f_euler(t, segment_ends, xt, vt, train_sampling_steps)
+        #         + (~more_than_threshold) * x_at_segment_ends
+        #         )
+        #     return res
+
+        def threshold_based_f_euler(t, xt, vt, threshold, x_start, train_sampling_steps):
+            if (threshold, int) and threshold == 0:
+                return x_start
+            
+            more_than_threshold = t > (1 - threshold) * train_sampling_steps
+            
+            res = (
+                more_than_threshold * f_euler(t, xt, vt, train_sampling_steps)
+                + (~more_than_threshold) * x_start
+                )
+            return res
+    
+        def cfg_forward(model_fn, latents, t, prev_t, null_y, infer_mask, m_kwargs, cfg_scale, train_sampling_steps):
+            latent_model_input = th.cat([latents] * 2)
+            prompt_embeds = th.cat([null_y, m_kwargs["y"]], dim=0)
+            mo_kwargs = dict(data_info=m_kwargs["data_info"])
+            t_expand = t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3])
+            prev_t_expand = prev_t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3])
+            v_pred = model_fn(latent_model_input, space*th.cat([t] * 2), prompt_embeds, mask=infer_mask, **mo_kwargs)
+            # perform guidance
+            v_pred_uncond, v_pred_text = v_pred.chunk(2)
+            v_pred = v_pred_uncond + cfg_scale * (v_pred_text - v_pred_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents_dtype = latents.dtype
+            prev_latents = latents + ((prev_t_expand - t_expand) / train_sampling_steps) * v_pred
+            prev_latents = prev_latents.to(latents_dtype)
+
+            return prev_latents
+
+        terms = {}
+
+        rng_state = th.cuda.get_rng_state()
+        vt = model(x_t, space*t, **model_kwargs)
+        # if isinstance(vt, dict) and vt.get("x", None) is not None:
+        #     vt = vt["x"]
+        # else:
+        #     vt = vt
+        
+        th.cuda.set_rng_state(rng_state) # Shared Dropout Mask
+        with th.no_grad():
+            if (isinstance(boundary, int) and boundary == 0): # when hyperparameter["boundary"] == 0, vr is not needed
+                vr = None
+            else:
+                x_r = cfg_forward(teacher_model, x_t, t, r, null_y, infer_mask, model_kwargs, cfg_scale=4.5, train_sampling_steps=train_sampling_steps)
+                vr = target_model(x_r, space*r, **model_kwargs)
+                # vr = model(x_r, space*r, **model_kwargs)
+                # if isinstance(vr, dict) and vr.get("x", None) is not None:
+                #     vr = vr["x"]
+                # else:
+                #     vr = vr
+                vr = th.nan_to_num(vr)
+
+        # ft = f_euler(t_expand, segment_ends_expand, x_t, vt, train_sampling_steps)
+        # fr = threshold_based_f_euler(r_expand, segment_ends_expand, x_r, vr, boundary, x_at_segment_ends, train_sampling_steps)
+        ft = f_euler(t_expand, x_t, vt, train_sampling_steps)
+        fr = threshold_based_f_euler(r_expand, x_r, vr, boundary, x_start, train_sampling_steps)
+
+        if vae is not None:
+            with th.no_grad():
+                samples_t = vae_decode("dc-ae", vae, ft.to(th.float16))
+                if lpips is not None:
+                    samples_r = vae_decode("dc-ae", vae, fr.to(th.float16))
+                    losses_l = lpips(samples_t, samples_r)
+                    # terms["loss_l"] = lpips(samples_t, samples_r).mean()
+            # samples_t = (
+            #     th.clamp(127.5 * samples_t + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=th.uint8).numpy()[0]
+            # )
+            # image = Image.fromarray(samples_t)
+            # # save image
+            # image.save(f"/data/baotang/sanacfm/tmp/{t}.png")
+
+        ##### loss #####
+        # losses_f = th.square(ft - fr)
+        # losses_f = reduce_op(losses_f.reshape(losses_f.shape[0], -1), dim=-1)
+        # losses_fo = th.square(ft - x_start)
+        # losses_fo = reduce_op(losses_fo.reshape(losses_fo.shape[0], -1), dim=-1)
+        losses_f = huber_loss(ft, fr, delta=0.001, reduce=False)
+        losses_f = reduce_op(losses_f.reshape(losses_f.shape[0], -1), dim=-1)
+
+        if (boundary, int) and boundary == 0:
+            losses_v = 0
+        else:
+            # less_than_threshold = t < boundary * train_sampling_steps
+            # less_than_threshold = less_than_threshold.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
+
+            more_than_threshold = t > (1 - boundary) * train_sampling_steps
+            more_than_threshold = more_than_threshold.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
+
+            # far_from_segment_ends = (segment_ends - t) > 1.01 * delta * train_sampling_steps
+            # far_from_segment_ends = (t - segment_ends) > 1.01 * delta * train_sampling_steps
+            far_from_segment_ends = t > 1.01 * delta * train_sampling_steps
+            far_from_segment_ends = far_from_segment_ends.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
+        
+            # losses_v = th.square(vt - vr)
+            losses_v = huber_loss(vt, vr, delta=0.001, reduce=False)
+            # losses_v = less_than_threshold * far_from_segment_ends * losses_v
+            losses_v = more_than_threshold * far_from_segment_ends * losses_v
+            losses_v = reduce_op(losses_v.reshape(losses_v.shape[0], -1), dim=-1)
+
+        # v_scale = 1e-5
+        v_scale = 1e-2
+        lpips_scale = 1e-1
+        terms["loss_f"] = th.mean(losses_f)
+        # terms["loss_fo"] = th.mean(losses_fo)
+        terms["loss_v"] = th.mean(v_scale * losses_v)
+        terms["loss_l"] = th.mean(lpips_scale * losses_l)
+        terms["loss"] = th.mean(losses_f + lpips_scale * losses_l)
+
+        return terms
+
+    def _get_timesteps(
+        self, num_samples: int = 1, K: int = 1, K_step: int = 1, device="cpu"
+    ):
+        # Get the timesteps for the current K
+        self.teacher_scheduler.set_timesteps(K)
+
+        # if self.timestep_distribution == "uniform":
+        #     prob = torch.ones(K) / K
+        # elif self.timestep_distribution == "gaussian":
+        #     prob = [torch.exp(-torch.tensor([(i - K / 2) ** 2 / K])) for i in range(K)]
+        #     prob = torch.tensor(prob) / torch.sum(torch.tensor(prob))
+        # elif self.timestep_distribution == "mixture":
+        mixture_num_components = self.mixture_num_components[K_step]
+        mode_probs = self.mode_probs[K_step]
+
+        # Define targeted timesteps
+        locs = [
+            i * (K // mixture_num_components)
+            for i in range(0, mixture_num_components)
+        ]
+        mixture_var = self.mixture_var[K_step]
+        prob = [
+            gaussian_mixture(
+                K,
+                locs=locs,
+                var=mixture_var,
+                mode_probs=mode_probs,
+            )(i)
+            for i in range(K)
+        ]
+        prob = th.tensor(prob) / th.sum(th.tensor(prob))
+
+        start_idx = th.multinomial(prob, 1)
+
+        start_timestep = (
+            self.teacher_scheduler.timesteps[start_idx]
+            .to(device)
+            .repeat(num_samples)
+        )
+
+        return start_idx, start_timestep
+
+    @staticmethod
+    def _pack_latents(latents: th.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> th.Tensor:
+        # Unpacked latents of shape are [B, C, F, H, W] are patched into tokens of shape [B, C, F // p_t, p_t, H // p, p, W // p, p].
+        # The patch dimensions are then permuted and collapsed into the channel dimension of shape:
+        # [B, F // p_t * H // p * W // p, C * p_t * p * p] (an ndim=3 tensor).
+        # dim=0 is the batch size, dim=1 is the effective video sequence length, dim=2 is the effective number of input features
+        batch_size, num_channels, num_frames, height, width = latents.shape
+        post_patch_num_frames = num_frames // patch_size_t
+        post_patch_height = height // patch_size
+        post_patch_width = width // patch_size
+        latents = latents.reshape(
+            batch_size,
+            -1,
+            post_patch_num_frames,
+            patch_size_t,
+            post_patch_height,
+            patch_size,
+            post_patch_width,
+            patch_size,
+        )
+        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        return latents
+
+    @staticmethod
+    def _unpack_latents(
+        latents: th.Tensor, num_frames: int, height: int, width: int, patch_size: int = 1, patch_size_t: int = 1) -> th.Tensor:
+        # Packed latents of shape [B, S, D] (S is the effective video sequence length, D is the effective feature dimensions)
+        # are unpacked and reshaped into a video tensor of shape [B, C, F, H, W]. This is the inverse operation of
+        # what happens in the `_pack_latents` method.
+        batch_size = latents.size(0)
+        latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
+        latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        return latents
+
+    def addistilling_losses(self, model, teacher_model, dmd_model, discriminator, x_start, train_sampling_steps, 
+                            null_y, y, model_kwargs=None, noise=None, skip_noise=False, teacher_data=None):
+        space = int(1000 / train_sampling_steps)
+        # assert space == 1
+        # assert train_sampling_steps == 1000
+        def f_euler(t, xt, vt, train_sampling_steps):
+            # for video
+            t_expand = t.view(-1, 1, 1, 1, 1).repeat(1, xt.shape[1], xt.shape[2], xt.shape[3], xt.shape[4])
+            return xt - (t_expand / train_sampling_steps) * vt
+        def cfg_forward(model_fn, latents, t, null_y, y, m_kwargs, cfg_scale, train_sampling_steps, space, guide_image):
+            latent_model_input = th.cat([latents] * 2)
+            prompt_embeds = th.cat([null_y, y], dim=0)
+            # mo_kwargs = dict(data_info=m_kwargs["data_info"])
+            mask = m_kwargs.pop("mask").squeeze(1).squeeze(1)
+            t_expand = t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3], latents.shape[4])
+            # v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), prompt_embeds, mask, **mo_kwargs)
+            v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), guide_image=guide_image, y=prompt_embeds, cond_mask=None, flow_score=None, mask=mask, **m_kwargs)
+            v_pred_uncond, v_pred_text = v_pred.chunk(2)
+            v_pred = v_pred_uncond + cfg_scale * (v_pred_text - v_pred_uncond)
+            # noise_pred = latents + (1 - t_expand / train_sampling_steps) * v_pred
+            # perform guidance
+            # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            # noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
+
+            # # compute the previous noisy sample x_t -> x_t-1
+            # latents_dtype = latents.dtype
+            # prev_latents = latents + ((prev_t_expand - t_expand) / train_sampling_steps) * noise_pred
+            # prev_latents = prev_latents.to(latents_dtype)
+
+            # return prev_latents
+            # return noise_pred
+            return v_pred
+
+        terms = {}
+        guidance_max = 9.0
+        guidance_min = 2.0
+        guidance_scale = (th.rand(1).to(x_start.device) * (guidance_max - guidance_min) + guidance_min)
+        data_info = {}
+        data_info["cfg_scale"] = guidance_scale
+        self.iter_steps += 1
+        if self.iter_steps > self.K_steps[-1]:
+            K_step = len(self.K) - 1
+        else:
+            K_step = np.argmax(self.iter_steps < self.K_steps)
+        K = self.K[K_step]
+        idx, timestep = self._get_timesteps(num_samples=x_start.shape[0], K=K, K_step=K_step, device=x_start.device)
+        t = timestep.to(th.int) - 1
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        model_kwargs["data_info"] = data_info
+        if skip_noise:
+            x_t = x_start
+        else:
+            if noise is None:
+                noise = th.randn_like(x_start)
+            x_t = self.q_sample(x_start, t, noise=noise)
+        guide_image = x_start[:, :, :1, :, :]
+        x_t = x_t.to(th.float32)
+        x_t[:,:,:1,:,:] = th.lerp(x_t[:,:,:1,:,:], guide_image, 1.0)
+        x_t = x_t.to(x_start.dtype)
+        cond_mask = None
+        flow_score = None
+        vt = model(x_t, t, guide_image=guide_image, y =y, cond_mask=cond_mask, flow_score=flow_score, **model_kwargs)
+        ft = f_euler(t, x_t, vt, self.num_timesteps)
+        ft = ft.to(th.float32)
+        ft[:,:,:1,:,:] = th.lerp(ft[:,:,:1,:,:], guide_image, 1.0)
+        ft = ft.to(x_start.dtype)
+
+        # # for ltx video teacher
+        # x_t_copy = x_t.clone().detach()
+        # null_t5 = th.load("/data/baotang/sana_videodistill/null_text_feature_t5.pt")
+        # t5_prompt_embeds = teacher_data["text_feat"].squeeze(1).to(x_t.device)
+        # t5_prompt_attention_mask = teacher_data["y_mask"].squeeze(1).to(x_t.device)
+        # null_prompt_embeds = null_t5["text_feat"].repeat(x_t.shape[0], 1, 1).to(t5_prompt_embeds.device)
+        # null_prompt_attention_mask = null_t5["y_mask"].repeat(x_t.shape[0], 1).to(t5_prompt_embeds.device)
+        # teacher_prompt_embeds = th.cat([null_prompt_embeds, t5_prompt_embeds], dim=0)
+        # teacher_prompt_attention_mask = th.cat([null_prompt_attention_mask, t5_prompt_attention_mask], dim=0)
+        # rope_interpolation_scale = (0.32, 32, 32)
+        # x_t_copy = self._pack_latents(x_t_copy)
+        # with th.no_grad():
+        #     for ti in self.teacher_scheduler.timesteps[idx:]:
+        #         latent_model_input = th.cat([x_t_copy] * 2)
+        #         # print(teacher_prompt_embeds.shape)
+        #         # print(teacher_prompt_attention_mask.shape)
+        #         # print(latent_model_input.shape)
+        #         # print(teacher_prompt_embeds.dtype)
+        #         # print(teacher_prompt_attention_mask.dtype)
+        #         # print(latent_model_input.dtype)
+        #         # input()
+        #         timestep_i = th.tensor(ti.expand(latent_model_input.shape[0]), device=x_t.device)
+        #         noise_pred = teacher_model(
+        #             hidden_states=latent_model_input.to(th.float16),
+        #             encoder_hidden_states=teacher_prompt_embeds.to(th.float16),
+        #             timestep=timestep_i,
+        #             # encoder_attention_mask=teacher_prompt_attention_mask.to(th.bool),
+        #             encoder_attention_mask=teacher_prompt_attention_mask,
+        #             num_frames=3,
+        #             height=8,
+        #             width=8,
+        #             rope_interpolation_scale=rope_interpolation_scale,
+        #             attention_kwargs=None,
+        #             return_dict=False,
+        #         )[0].float()
+        #         # print(noise_pred.shape)
+        #         # input()
+        #         v_ti_uncond, v_ti_cond = noise_pred.chunk(2)
+        #         v_ti = v_ti_uncond + guidance_scale * (v_ti_cond - v_ti_uncond)
+        #         x_t_copy = self.teacher_scheduler.step(v_ti, ti, x_t_copy, return_dict=False)[0]
+
+        # teacher_output =self._unpack_latents(x_t_copy, 3, 8, 8)
+
+        x_t_copy = x_t.clone().detach()
+        with th.no_grad():
+            for ti in self.teacher_scheduler.timesteps[idx:]:
+                timestep_i = th.tensor(ti.expand(x_t.shape[0]), device=x_t.device)
+                v_ti_cond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=y, cond_mask=None, flow_score=None, **model_kwargs)
+                v_ti_uncond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=null_y, cond_mask=None, flow_score=None, **model_kwargs)
+                v_ti = v_ti_uncond + guidance_scale * (v_ti_cond - v_ti_uncond)
+                x_t_copy = self.teacher_scheduler.step(v_ti, ti, x_t_copy, return_dict=False)[0]
+                x_t_copy = x_t_copy.to(th.float32)
+                x_t_copy[:,:,:1,:,:] = th.lerp(x_t_copy[:,:,:1,:,:], guide_image, 1.0)
+                x_t_copy = x_t_copy.to(x_start.dtype)
+        teacher_output = x_t_copy
+
+        # loss_recon = th.square(ft - x_start)
+        # loss_recon = th.mean(loss_recon.reshape(loss_recon.shape[0], -1), dim=-1)
+        # loss_recon = huber_loss(ft, x_start, delta=0.001)
+        loss_recon = huber_loss(ft, teacher_output, delta=0.001)
+
+        # gan_loss
+        gan_loss_type = "lsgan"
+        # selected_timesteps = [10, 250, 500, 750]
+        selected_timesteps = [int(x * self.num_timesteps) for x in [0.01, 0.25, 0.5, 0.75]]
+        prob = th.tensor([0.25, 0.25, 0.25, 0.25])
+        idx = prob.multinomial(ft.shape[0], replacement=True).to(ft.device)
+        t2 = th.tensor(selected_timesteps, device=ft.device, dtype=th.long)[idx].expand(x_start.shape[0])
+        # noisy_real = self.q_sample(x_start, t2, noise=noise)
+        noisy_real = self.q_sample(teacher_output, t2, noise=noise)
+        noisy_real = noisy_real.to(th.float32)
+        noisy_real[:,:,:1,:,:] = th.lerp(noisy_real[:,:,:1,:,:], guide_image, 1.0)
+        noisy_real = noisy_real.to(x_start.dtype)
+        noisy_fake = self.q_sample(ft, t2, noise=noise)
+        noisy_fake = noisy_fake.to(th.float32)
+        noisy_fake[:,:,:1,:,:] = th.lerp(noisy_fake[:,:,:1,:,:], guide_image, 1.0)
+        noisy_fake = noisy_fake.to(x_start.dtype)
+        loss_G, loss_D = gan_loss(noisy_real, noisy_fake, t2, y, model_kwargs, gan_loss_type, teacher_model, discriminator, step=self.iter_steps)
+        
+        # dmd_loss
+        noise2 = th.randn_like(ft)
+        target2 = (noise2 - ft).detach()
+        timestep2 = th.randint(0, train_sampling_steps, (ft.shape[0],), device=ft.device)
+        # idx2 = th.randint(0, K, (ft.shape[0],), device=ft.device)
+        # timestep2 = th.tensor(self.teacher_scheduler.timesteps.to(ft.device)[idx2], device=ft.device).to(th.int) - 1
+        t2_expand = timestep2.view(-1, 1, 1, 1, 1).repeat(1, ft.shape[1], ft.shape[2], ft.shape[3], ft.shape[4])
+        noisy_student = self.q_sample(ft, space * timestep2, noise=noise2)
+        noisy_student = noisy_student.to(th.float32)
+        noisy_student[:,:,:1,:,:] = th.lerp(noisy_student[:,:,:1,:,:], guide_image, 1.0)
+        noisy_student = noisy_student.to(x_start.dtype)
+        v_s = dmd_model(noisy_student, space * timestep2, guide_image=guide_image, y =y, cond_mask=cond_mask, flow_score=flow_score, **model_kwargs)
+        x_0_s = noisy_student + (- t2_expand / train_sampling_steps) * v_s
+        score_s = -x_0_s
+        with th.no_grad():
+            v_t = cfg_forward(teacher_model, noisy_student, timestep2, null_y, y,
+                                model_kwargs, cfg_scale=guidance_scale, train_sampling_steps=train_sampling_steps, space=space, guide_image=guide_image)
+            # score_t = -v_t
+            # v_s = dmd_model(noisy_student, space * timestep2, y, **model_kwargs)
+            # score_s = -(noisy_student - (1 + t2_expand / train_sampling_steps) * v_s)
+            # score_s = -v_s
+            x_0_t = noisy_student + (- t2_expand / train_sampling_steps) * v_t
+            score_t = -x_0_t
+        # alpha_prod_t = self.alphas_cumprod.to(device=ft.device, dtype=ft.dtype)[timestep2]
+        # print(self.alphas_cumprod)
+        # print(self.betas_cumprod)
+        # print(self.one_minus_sigmas_cumprod)
+        # print(len(self.one_minus_sigmas_cumprod))
+        # print(self.posterior_mean_coef1)
+        # print(self.posterior_mean_coef2)
+
+        # alpha_prod_t = 1.0 - th.tensor(self.posterior_mean_coef2, device=ft.device, dtype=ft.dtype)[space * timestep2]
+        # beta_prod_t = 1.0 - alpha_prod_t
+        # coeff = ((score_s - score_t) * beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
+        
+        # sqrt_alpha_prod_t = th.tensor(self.one_minus_sigmas, device=ft.device, dtype=ft.dtype)[space * timestep2]
+        # sqrt_beta_prod_t = th.tensor(self.sigmas, device=ft.device, dtype=ft.dtype)[space * timestep2]
+        # coeff = ((score_s - score_t) * sqrt_beta_prod_t.view(-1, 1, 1, 1, 1) / sqrt_alpha_prod_t.view(-1, 1, 1, 1, 1))
+
+        # coeff = ((score_s - score_t) * sqrt_beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / sqrt_alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
+
+        # alpha_prod_t = th.tensor(self.alpha_cumprod_aux, device=ft.device, dtype=ft.dtype)[space * timestep2]
+        # beta_prod_t = 1.0 - alpha_prod_t
+        # coeff = ((score_s - score_t) * beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
+
+        coeff = score_t - score_s
+        weight = (1.0 / ((ft - x_0_t).abs().mean([1, 2, 3, 4], keepdim=True) + 1e-5).detach())
+        loss_dmd = F.mse_loss(ft, (ft - weight * coeff).detach(), reduction="mean")
+        # loss_dmd = F.mse_loss(ft, (ft - weight * coeff), reduction="mean")
+        loss_dmdmodel = th.mean((target2 - v_s) ** 2)
+
+        if self.iter_steps % 2 == 0:
+            loss_dmd = th.tensor(0.0)
+        else: 
+            loss_dmdmodel = th.tensor(0.0)
+
+        add_scale = [0.0, 0.05, 0.1, 0.2]
+        dmd_scale = [0.0, 0.3, 0.5, 0.7]
+        terms["loss_dmd"] = dmd_scale[K_step] * loss_dmd
+        terms["loss_dmdmodel"] = dmd_scale[K_step] * loss_dmdmodel
+        terms["loss_G"] = add_scale[K_step] * loss_G
+        terms["loss_D"] = loss_D
+        terms["loss_recon"] = loss_recon
+        # terms["loss"] = terms["loss_G"] + terms["loss_D"] + terms["loss_recon"]
+        # terms["loss"] = terms["loss_recon"] + terms["loss_dmd"] + terms["loss_dmdmodel"]
+        terms["loss"] = terms["loss_G"] + terms["loss_D"] + terms["loss_recon"] + terms["loss_dmd"] + terms["loss_dmdmodel"]
+
+        return terms
+
+        
+    def training_losses_diffusers(self, model, x_start, timestep, model_kwargs=None, noise=None, skip_noise=False):
+        """
+        Compute training losses for a single timestep.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param t: a batch of timestep indices.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param noise: if specified, the specific Gaussian noise to try to remove.
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+                 Some mean or variance settings may also have other keys.
+        """
+        t = timestep
+        if model_kwargs is None:
+            model_kwargs = {}
+        if skip_noise:
+            x_t = x_start
+        else:
+            if noise is None:
+                noise = th.randn_like(x_start)
+            x_t = self.q_sample(x_start, t, noise=noise)
+
+        terms = {}
+
+        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            terms["loss"] = self._vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+            )["output"]
+            if self.loss_type == LossType.RESCALED_KL:
+                terms["loss"] *= self.num_timesteps
+        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            output = model(x_t, timestep=t, **model_kwargs, return_dict=False)[0]
+
+            if self.return_startx and self.model_mean_type == ModelMeanType.EPSILON:
+                B, C = x_t.shape[:2]
+                assert output.shape == (B, C * 2, *x_t.shape[2:])
+                output = th.split(output, C, dim=1)[0]
+                return output, self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output), x_t
+
+            if self.model_var_type in [
+                ModelVarType.LEARNED,
+                ModelVarType.LEARNED_RANGE,
+            ]:
+                B, C = x_t.shape[:2]
+                assert output.shape == (B, C * 2, *x_t.shape[2:])
+                output, model_var_values = th.split(output, C, dim=1)
+                # Learn the variance using the variational bound, but don't let it affect our mean prediction.
+                frozen_out = th.cat([output.detach(), model_var_values], dim=1)
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out, **kwargs: r,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+                if self.loss_type == LossType.RESCALED_MSE:
+                    # Divide by 1000 for equivalence with initial implementation.
+                    # Without a factor of 1/1000, the VB term hurts the MSE term.
+                    terms["vb"] *= self.num_timesteps / 1000.0
+
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+            }[self.model_mean_type]
+            assert output.shape == target.shape == x_start.shape
+            if self.snr:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_noise = self._predict_eps_from_xstart(x_t=x_t, t=t, pred_xstart=output)
+                    pred_startx = output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_noise = output
+                    pred_startx = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=output)
+                # terms["mse_eps"] = mean_flat((noise - pred_noise) ** 2)
+                # terms["mse_x0"] = mean_flat((x_start - pred_startx) ** 2)
+
+                t = t[:, None, None, None].expand(pred_startx.shape)  # [128, 4, 32, 32]
+                # best
+                target = th.where(t > 249, noise, x_start)
+                output = th.where(t > 249, pred_noise, pred_startx)
+            loss = (target - output) ** 2
+            terms["mse"] = mean_flat(loss)
+            if "vb" in terms:
+                terms["loss"] = terms["mse"] + terms["vb"]
+            else:
+                terms["loss"] = terms["mse"]
+            if "mae" in terms:
+                terms["loss"] = terms["loss"] + terms["mae"]
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        return terms
+
+    def _prior_bpd(self, x_start):
+        """
+        Get the prior KL term for the variational lower-bound, measured in
+        bits-per-dim.
+        This term can't be optimized, as it only depends on the encoder.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :return: a batch of [N] KL values (in bits), one per batch element.
+        """
+        batch_size = x_start.shape[0]
+        t = th.tensor([self.num_timesteps - 1] * batch_size, device=x_start.device)
+        qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t)
+        kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
+        return mean_flat(kl_prior) / np.log(2.0)
+
+    def calc_bpd_loop(self, model, x_start, clip_denoised=True, model_kwargs=None):
+        """
+        Compute the entire variational lower-bound, measured in bits-per-dim,
+        as well as other related quantities.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param clip_denoised: if True, clip denoised samples.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict containing the following keys:
+                 - total_bpd: the total variational lower-bound, per batch element.
+                 - prior_bpd: the prior term in the lower-bound.
+                 - vb: an [N x T] tensor of terms in the lower-bound.
+                 - xstart_mse: an [N x T] tensor of x_0 MSEs for each timestep.
+                 - mse: an [N x T] tensor of epsilon MSEs for each timestep.
+        """
+        device = x_start.device
+        batch_size = x_start.shape[0]
+
+        vb = []
+        xstart_mse = []
+        mse = []
+        for t in list(range(self.num_timesteps))[::-1]:
+            t_batch = th.tensor([t] * batch_size, device=device)
+            noise = th.randn_like(x_start)
+            x_t = self.q_sample(x_start=x_start, t=t_batch, noise=noise)
+            # Calculate VLB term at the current timestep
+            with th.no_grad():
+                out = self._vb_terms_bpd(
+                    model,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t_batch,
+                    clip_denoised=clip_denoised,
+                    model_kwargs=model_kwargs,
+                )
+            vb.append(out["output"])
+            xstart_mse.append(mean_flat((out["pred_xstart"] - x_start) ** 2))
+            eps = self._predict_eps_from_xstart(x_t, t_batch, out["pred_xstart"])
+            mse.append(mean_flat((eps - noise) ** 2))
+
+        vb = th.stack(vb, dim=1)
+        xstart_mse = th.stack(xstart_mse, dim=1)
+        mse = th.stack(mse, dim=1)
+
+        prior_bpd = self._prior_bpd(x_start)
+        total_bpd = vb.sum(dim=1) + prior_bpd
+        return {
+            "total_bpd": total_bpd,
+            "prior_bpd": prior_bpd,
+            "vb": vb,
+            "xstart_mse": xstart_mse,
+            "mse": mse,
+        }
+
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch
+                            dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res + th.zeros(broadcast_shape, device=timesteps.device)

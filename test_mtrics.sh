@@ -1,0 +1,1 @@
+python scripts/evaluate_FVD.py -dir1 /data/vepfs/users/shuaizhang/real-estate-10k/test_256_61 -dir2 /data/vepfs/users/shuaizhang/DiffSynth-Studio2/test_video_61 -b 1 -r 256 -n 61 -ns 6098 -i3d ./i3d_torchscript.pt

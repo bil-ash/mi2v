@@ -1,0 +1,109 @@
+data:
+  data_dir: [/data/baotang/sana_videodistill/kinetics-600/output_training.csv]
+  # data_path: [/data/baotang/sana_videodistill/ucfnew.csv]
+  image_size: 512
+  # transform_name: resize_crop
+  type: VideoTextDataset # SanaWebDataset
+  num_frames: 17
+  # frame_interval: 1
+# model config
+model:
+  model: ZS_Sana_300M_P1_D14_3d
+  image_size: 512
+  mixed_precision: fp16
+  fp32_attention: true
+  # load_from: /data1/yuetingzhu/epoch_79_step_78000.pth
+  # resume_from:
+  aspect_ratio_type: ASPECT_RATIO_512
+  # multi_scale: true
+  multi_scale: false
+  #pe_interpolation: 1.
+  attn_type: linear
+  # temp_type: linear
+  linear_head_dim: 32
+  ffn_type: glumbconv
+  mlp_acts:
+    - silu
+    - silu
+    - null
+  mlp_ratio: 2.5
+  use_pe: false
+  qk_norm: false
+  class_dropout_prob: 0.1
+  cfg_scale: 5
+  cfg_embed: true
+  cfg_embed_scale: 0.1
+# VAE setting
+vae:
+  vae_type: ltx-video
+  vae_pretrained: /data/baotang/sana_videodistill/reference/pretrained/LTX-Video/vae
+  vae_latent_dim: 128
+  vae_downsample_rate: 32
+# text encoder
+text_encoder:
+  text_encoder_name: Qwen2-0.5B-Instruct
+  y_norm: true
+  y_norm_scale_factor: 0.01
+  model_max_length: 300
+  caption_channels: 896
+  # CHI
+  # chi_prompt:
+  #   - 'Given a user prompt, generate an "Enhanced prompt" that provides detailed visual descriptions suitable for image generation. Evaluate the level of detail in the user prompt:'
+  #   - '- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.'
+  #   - '- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.'
+  #   - 'Here are examples of how to transform or refine prompts:'
+  #   - '- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.'
+  #   - '- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.'
+  #   - 'Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:'
+  #   - 'User Prompt: '
+# Sana schedule Flow
+scheduler:
+  train_sampling_steps: 1000
+  predict_v: true
+  noise_schedule: linear_flow
+  pred_sigma: false
+  flow_shift: 1.0
+  # logit-normal timestep
+  weighting_scheme: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+  # vis_sampler: flow_dpm-solver
+  vis_sampler: flow_euler
+# training setting
+train:
+  num_workers: 10
+  seed: 1
+  train_batch_size: 16
+  num_epochs: 1000
+  gradient_accumulation_steps: 1
+  grad_checkpointing: true
+  gradient_clip: 0.1
+  optimizer:
+    betas:
+      - 0.9
+      - 0.999
+      - 0.9999
+    eps:
+      - 1.0e-30
+      - 1.0e-16
+    # lr: 0.0001
+    lr: 0.0001
+    type: CAMEWrapper
+    weight_decay: 0.1
+  lr_schedule: constant
+  lr_schedule_args:
+    num_warmup_steps: 2000
+  local_save_vis: true # if save log image locally
+  visualize: true
+  validation_prompts:
+       - The video features a man in a black and red hat, glasses, and a red tie, standing in a bustling city street. He is looking to his left, seemingly intrigued by something out of frame. The background is filled with people walking by, and a red and white double-decker bus is visible, adding to the urban atmosphere. The man's attire and the city setting suggest a modern, possibly European city. The video captures a moment of everyday life in a busy city, with the man's curious gaze adding a touch of intrigue.
+       - The video features a man with a beard and short hair, wearing a blue polka dot shirt. He is pointing his finger towards the camera, suggesting a sense of accusation or accusation. The man appears to be in a casual setting, possibly a backyard or a park, with a fence visible in the background. The lighting suggests it might be daytime. The man's expression is serious, and he seems to be making a point or explaining something. The overall style of the video is straightforward and direct, with the man's gesture being the main focus.
+  eval_sampling_steps: 500
+  log_interval: 50
+  save_model_epochs: 500000
+  save_model_steps: 4000
+  work_dir: output/debug
+  online_metric: false
+  eval_metric_step: 100000
+  online_metric_dir: metric_helper
+  scm_cfg_scale: [4, 4.5, 5]
