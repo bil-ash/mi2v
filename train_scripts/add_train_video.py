@@ -120,22 +120,22 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
             '''
 
             if prompt == "The video features a man in a tuxedo, smiling and looking to the side. The man is well-dressed, wearing a black suit with a white shirt and a black bow tie. He has short, light-colored hair and appears to be in a good mood. The background is blurred, but it seems to be an indoor setting, possibly a room with a wooden floor and walls. The lighting is soft and warm, suggesting an indoor environment. The man's expression and attire suggest a formal or celebratory occasion.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test1.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test1.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
             elif prompt == "This person is talking1.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test2.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test2.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
             elif prompt == "This person is talking2.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test2.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test2.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([2.0]).to(accelerator.device)
             elif prompt == "This person is talking5.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test3.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test3.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
             elif prompt == "This person is talking10.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test4.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([10.0]).to(accelerator.device)
             else:
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_iamge/test4.jpg").convert("RGB")
+                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
             transform = transforms.Compose([
                  transforms.ToTensor(),
@@ -780,6 +780,7 @@ def main(cfg: SanaConfig) -> None:
                 else:
                     raise ValueError(f"{config.text_encoder.text_encoder_name} is not supported!!")
 
+                os.makedirs(os.path.dirname(prompt_embed_path), exist_ok=True)
                 torch.save({"caption_embeds": caption_emb, "emb_mask": caption_emb_mask}, prompt_embed_path)
 
             null_tokens = tokenizer(
@@ -791,6 +792,7 @@ def main(cfg: SanaConfig) -> None:
                 null_token_emb = text_encoder(null_tokens.input_ids, attention_mask=null_tokens.attention_mask)[0]
             else:
                 raise ValueError(f"{config.text_encoder.text_encoder_name} is not supported!!")
+            os.makedirs(os.path.dirname(null_embed_path), exist_ok=True)
             torch.save(
                 {"uncond_prompt_embeds": null_token_emb, "uncond_prompt_embeds_mask": null_tokens.attention_mask},
                 null_embed_path,

@@ -146,7 +146,7 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
             prompt_clean, _, hw, ar, custom_hw = prepare_prompt_ar(prompt, base_ratios, device=device, show=False)
             latent_size_h, latent_size_w = (
                 (int(hw[0, 0] // config.vae.vae_downsample_rate), int(hw[0, 1] // config.vae.vae_downsample_rate))
-                if args.image_size == 1024
+                if args.image_height == 1024
                 else (latent_size, latent_size)
             )
             prompts.append(prompt_clean.strip())
@@ -205,7 +205,10 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
                 image_name =image_path.split('/')[-1]
                 cap = cv2.VideoCapture(image_path)
                 print(image_path)
-                _, ref_image = cap.read()
+                ret, ref_image = cap.read()
+                cap.release()
+                if not ret or ref_image is None:
+                    raise ValueError(f"Failed to read video frame from: {image_path}. Please check if the file exists and is a valid video.")
                 ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
             else:
                 image_name =image_path.split('/')[-1]
@@ -214,7 +217,7 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
 
             transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Resize([720,1280]),
+                transforms.Resize([int(hw[0, 0].item()), int(hw[0, 1].item())]),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ])
             ref_image = transform(ref_image).to(device)
@@ -389,7 +392,16 @@ if __name__ == "__main__":
     logger.warning(f"Missing keys: {missing}")
     logger.warning(f"Unexpected keys: {unexpected}")
     model.eval().to(weight_dtype)
-    base_ratios = eval(f"ASPECT_RATIO_1024_TEST")
+    if args.image_height == 512:
+        base_ratios = ASPECT_RATIO_512_TEST
+    elif args.image_height == 1024:
+        base_ratios = ASPECT_RATIO_1024_TEST
+    elif args.image_height == 2048:
+        base_ratios = ASPECT_RATIO_2048_TEST
+    elif args.image_height == 4096:
+        base_ratios = ASPECT_RATIO_4096_TEST
+    else:
+        base_ratios = ASPECT_RATIO_1024_TEST
     args.sampling_algo = (
         args.sampling_algo
         if ("flow" not in args.model_path or args.sampling_algo == "flow_dpm-solver")

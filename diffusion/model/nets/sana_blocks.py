@@ -520,6 +520,7 @@ class Attention(Attention_):
         v = v.reshape(B, N, H, C // H).permute(0, 2, 1, 3)  # (B, H, N, C//H)
 
         use_fp32_attention = getattr(self, "fp32_attention", False)
+        attn_dtype = qkv.dtype
         if use_fp32_attention:
             q, k = q.float(), k.float()
 
@@ -537,7 +538,8 @@ class Attention(Attention_):
             attn = attn.softmax(dim=-1)
 
         attn = self.attn_drop(attn)
-        #attn = self.attn_drop(attn).half()
+        if use_fp32_attention:
+            attn = attn.to(attn_dtype)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)

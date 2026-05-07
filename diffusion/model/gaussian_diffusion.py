@@ -1173,8 +1173,9 @@ class GaussianDiffusion:
             # mo_kwargs = dict(data_info=m_kwargs["data_info"])
             mask = m_kwargs.pop("mask").squeeze(1).squeeze(1)
             t_expand = t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3], latents.shape[4])
+            cond_mask_input = th.cat([cond_mask] * 2) if cond_mask is not None else None
             # v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), prompt_embeds, mask, **mo_kwargs)
-            v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), guide_image=guide_image, y=prompt_embeds, cond_mask=None, flow_score=None, mask=mask, **m_kwargs)
+            v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), guide_image=guide_image, y=prompt_embeds, cond_mask=cond_mask_input, flow_score=None, mask=mask, **m_kwargs)
             v_pred_uncond, v_pred_text = v_pred.chunk(2)
             v_pred = v_pred_uncond + cfg_scale * (v_pred_text - v_pred_uncond)
             # noise_pred = latents + (1 - t_expand / train_sampling_steps) * v_pred
@@ -1219,7 +1220,14 @@ class GaussianDiffusion:
         x_t = x_t.to(th.float32)
         x_t[:,:,:1,:,:] = th.lerp(x_t[:,:,:1,:,:], guide_image, 1.0)
         x_t = x_t.to(x_start.dtype)
-        cond_mask = None
+        batch_size,dim,frames,H, W = x_t.shape
+        
+        cond_mask = th.zeros(
+                (batch_size, frames*H*W),
+                dtype=th.float32,
+                device=x_t.device,
+            )
+        cond_mask[:, :1*H*W] = 1
         flow_score = None
         vt = model(x_t, t, guide_image=guide_image, y =y, cond_mask=cond_mask, flow_score=flow_score, **model_kwargs)
         ft = f_euler(t, x_t, vt, self.num_timesteps)
@@ -1274,8 +1282,8 @@ class GaussianDiffusion:
         with th.no_grad():
             for ti in self.teacher_scheduler.timesteps[idx:]:
                 timestep_i = th.tensor(ti.expand(x_t.shape[0]), device=x_t.device)
-                v_ti_cond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=y, cond_mask=None, flow_score=None, **model_kwargs)
-                v_ti_uncond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=null_y, cond_mask=None, flow_score=None, **model_kwargs)
+                v_ti_cond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=y, cond_mask=cond_mask, flow_score=None, **model_kwargs)
+                v_ti_uncond = teacher_model(x_t_copy, timestep_i, guide_image=guide_image, y=null_y, cond_mask=cond_mask, flow_score=None, **model_kwargs)
                 v_ti = v_ti_uncond + guidance_scale * (v_ti_cond - v_ti_uncond)
                 x_t_copy = self.teacher_scheduler.step(v_ti, ti, x_t_copy, return_dict=False)[0]
                 x_t_copy = x_t_copy.to(th.float32)
