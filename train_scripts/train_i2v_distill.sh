@@ -1,4 +1,4 @@
-#/bin/bash
+#!/bin/bash
 set -e
 
 work_dir=output_flow_2/debug

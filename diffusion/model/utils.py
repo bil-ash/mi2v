@@ -67,9 +67,9 @@ def auto_grad_checkpoint(module, *args, **kwargs):
     if getattr(module, "grad_checkpointing", False):
         if isinstance(module, Iterable):
             gc_step = module[0].grad_checkpointing_step
-            return checkpoint_sequential(module, gc_step, *args, **kwargs)
+            return checkpoint_sequential(module, gc_step, *args, use_reentrant=False, **kwargs)
         else:
-            return checkpoint(module, *args, **kwargs)
+            return checkpoint(module, *args, use_reentrant=False, **kwargs)
     return module(*args, **kwargs)
 
 
@@ -96,7 +96,7 @@ def checkpoint_sequential(functions, step, input, *args, **kwargs):
     segment = len(functions) // step
     for start in range(0, step * (segment - 1), step):
         end = start + step - 1
-        input = checkpoint(run_function(start, end, functions), input, preserve_rng_state=preserve)
+        input = checkpoint(run_function(start, end, functions), input, preserve_rng_state=preserve, use_reentrant=False)
     return run_function(end + 1, len(functions) - 1, functions)(input)
 
 

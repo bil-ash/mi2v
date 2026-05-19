@@ -1,5 +1,5 @@
 data:
-  data_path: [./data_512_flow_flow.csv]
+  data_path: [./data.csv]
   image_height: 512
   image_width: 512
   transform_name: resize_crop
@@ -14,7 +14,7 @@ model:
   mixed_precision: fp16
   fp32_attention: true
   #load_from: ./model/hybrid_371.pth
-  load_from: /data/vepfs/users/shuaizhang/MobileI2V_CAM/model/hybrid_371.pth
+  load_from: ./model/hybrid_371.pth
   # resume_from:
   aspect_ratio_type: ASPECT_RATIO_512
   multi_scale: false
@@ -35,14 +35,14 @@ model:
 # VAE setting
 vae:
   vae_type: video-vae
-  vae_pretrained: /data/vepfs/users/shuaizhang/MobileI2V_CAM/model/video-vae
+  vae_pretrained: ./model/video-vae
   scale_factor: 0.41407
   vae_latent_dim: 128
   vae_downsample_rate: 32
   sample_posterior: true
 # text encoder
 text_encoder:
-  text_encoder_name: /data/vepfs/users/shuaizhang/MobileI2V_CAM/model/Qwen2-0.5B
+  text_encoder_name: ./model/Qwen2-0.5B
   y_norm: true
   y_norm_scale_factor: 0.01
   model_max_length: 300
@@ -74,7 +74,7 @@ scheduler:
 train:
   num_workers: 4
   seed: 1
-  train_batch_size: 16
+  train_batch_size: 2
   num_epochs: 1000
   gradient_accumulation_steps: 1
   grad_checkpointing: true

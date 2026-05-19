@@ -31,7 +31,7 @@ from torchvision import transforms
 import numpy as np
 import pyrallis
 import torch
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.utils import DistributedType
 from PIL import Image
 from termcolor import colored
@@ -120,22 +120,22 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
             '''
 
             if prompt == "The video features a man in a tuxedo, smiling and looking to the side. The man is well-dressed, wearing a black suit with a white shirt and a black bow tie. He has short, light-colored hair and appears to be in a good mood. The background is blurred, but it seems to be an indoor setting, possibly a room with a wooden floor and walls. The lighting is soft and warm, suggesting an indoor environment. The man's expression and attire suggest a formal or celebratory occasion.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test1.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test1.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
             elif prompt == "This person is talking1.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test2.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test2.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
             elif prompt == "This person is talking2.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test2.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test2.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([2.0]).to(accelerator.device)
             elif prompt == "This person is talking5.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test3.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test3.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
             elif prompt == "This person is talking10.":
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test4.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([10.0]).to(accelerator.device)
             else:
-                ref_image = Image.open("/data/vepfs/users/shuaizhang/MobileI2V_distill/test_image/test4.jpg").convert("RGB")
+                ref_image = Image.open("./test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
             transform = transforms.Compose([
                  transforms.ToTensor(),
@@ -417,7 +417,7 @@ def train(config, args, accelerator, model, teacher_model, dmd_model, discrimina
             lm_time_all += time.time() - lm_time_start
             model_time_start = time.time()
             # with accelerator.accumulate(model):
-            with accelerator.accumulate(model) and accelerator.accumulate(discriminator):
+            with accelerator.accumulate(model) and accelerator.accumulate(discriminator) and accelerator.accumulate(dmd_model):
                 # Predict the noise residual
                 optimizer.zero_grad()
                 optimizer_disc.zero_grad()
@@ -636,6 +636,7 @@ def main(cfg: SanaConfig) -> None:
 
     init_handler = InitProcessGroupKwargs()
     init_handler.timeout = datetime.timedelta(seconds=5400)  # change timeout to avoid a strange NCCL bug
+    #ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
     # Initialize accelerator and tensorboard logging
     if config.train.use_fsdp:
         init_train = "FSDP"
@@ -656,7 +657,7 @@ def main(cfg: SanaConfig) -> None:
         log_with=args.report_to,
         project_dir=osp.join(config.work_dir, "logs"),
         fsdp_plugin=fsdp_plugin,
-        kwargs_handlers=[init_handler],
+        #kwargs_handlers=[init_handler, ddp_handler],
     )
 
     log_name = "train_log.log"
@@ -917,14 +918,14 @@ def main(cfg: SanaConfig) -> None:
         _, _, _, _ = load_checkpoint(
             # config.model.load_from,
             # "/data/baotang/sana_videodistill/pretrained/zyt/epoch_136_step_135000.pth",
-            "/data/vepfs/users/shuaizhang/MobileI2V_CAM/model/hybrid_371.pth",
+            "./model/hybrid_371.pth",
             teacher_model,
             load_ema=False,
             null_embed_path=null_embed_path,
         )
         _, _, _, _ = load_checkpoint(
             # config.model.load_from,
-            "/data/vepfs/users/shuaizhang/MobileI2V_CAM/model/hybrid_371.pth",
+            "./model/hybrid_371.pth",
             dmd_model,
             load_ema=False,
             null_embed_path=null_embed_path,
@@ -1057,6 +1058,15 @@ def main(cfg: SanaConfig) -> None:
     start_epoch = 0
     start_step = 0
     total_steps = train_dataloader_len * config.train.num_epochs
+
+    # Patch DDP to use find_unused_parameters=True because flow_embedder/flow_block
+    # are created but never used when flow_score=None, causing DDP to fail.
+    import torch.nn as nn
+    _original_ddp_init = nn.parallel.DistributedDataParallel.__init__
+    def _patched_ddp_init(self, module, *args, **kwargs):
+        kwargs["find_unused_parameters"] = True
+        return _original_ddp_init(self, module, *args, **kwargs)
+    nn.parallel.DistributedDataParallel.__init__ = _patched_ddp_init
 
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the

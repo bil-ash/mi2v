@@ -21,7 +21,7 @@
 
 import os
 import sys
-sys.path.append("/data/vepfs/users/shuaizhang/MobileI2V_distill")
+sys.path.append("/data/shuaizhang/MobileI2V_distill/")
 from diffusion.model.addistill.loss import gan_loss
 from diffusion.model.tbutils import huber_loss, gaussian_mixture
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -260,32 +260,14 @@ class GaussianDiffusion:
         self.posterior_mean_coef1 = betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
 
-        # by myself
-        # self.iter_steps = 10000
         self.iter_steps = 0
         self.teacher_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=self.num_timesteps, shift=3.0)
-        self.mixture_num_components = [4, 4, 4, 4]
-        self.mode_probs = [
-            [0.0, 0.0, 0.5, 0.5],
-            [0.1, 0.3, 0.3, 0.3],
-            [0.25, 0.25, 0.25, 0.25],
-            [0.4, 0.2, 0.2, 0.2],
-        ]
-        # self.mode_probs = [
-        #     [0.25, 0.25, 0.25, 0.25],
-        #     [0.25, 0.25, 0.25, 0.25],
-        #     [0.25, 0.25, 0.25, 0.25],
-        #     [0.25, 0.25, 0.25, 0.25],
-        # ]
-        self.mixture_var = [0.5, 0.5, 0.5, 0.5]
-        self.K = [16, 16, 16, 16]
-        # self.num_iterations_per_K = [8000, 8000, 8000, 8000]
-        self.num_iterations_per_K = [4000, 4000, 4000, 4000]
-        self.K_steps = np.cumsum(self.num_iterations_per_K)
-        # self.betas_aux = np.linspace(0.0001, 0.02, 1000, dtype=np.float64)
-        # self.alphas_aux = 1.0 - self.betas_aux  
-        # self.alpha_cumprod_aux = np.cumprod(self.alphas_aux)
-        # self.one_minus_sigmas_cumprod = np.cumprod(self.one_minus_sigmas[::2])
+        self.mixture_num_components = 4
+        self.mode_probs = [0.25, 0.25, 0.25, 0.25]
+        self.mixture_var = 0.5
+        self.K = 16
+        self.add_scale = 0.1
+        self.dmd_scale = 0.5
 
     def q_mean_variance(self, x_start, t):
         """
@@ -896,213 +878,21 @@ class GaussianDiffusion:
 
         return terms
 
-    def consistency_losses(self, model, teacher_model, target_model, x_start, timestep, train_sampling_steps, null_y, infer_mask, model_kwargs=None, noise=None, skip_noise=False, vae=None, lpips=None):
-        """
-        Compute training losses for a single timestep.
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
-        """
-        # num_segments = 2
-        boundary = 1.0
-        # boundary = 0
-        reduce_op = th.mean
-        shape = x_start.shape
-        space = int(1000 / train_sampling_steps)
-        # delta = 1e-3
-        # delta = 2e-2
-        delta = space / 1000
-
-        t = timestep
-        # r = th.clamp(t + int(delta * train_sampling_steps), max=train_sampling_steps - 1)
-        r = th.clamp(t - int(delta * train_sampling_steps), min=0)
-
-        if model_kwargs is None:
-            model_kwargs = {}
-        if skip_noise:
-            x_t = x_start
-        else:
-            if noise is None:
-                noise = th.randn_like(x_start)
-            x_t = self.q_sample(x_start, space*t, noise=noise)
-
-        t_expand = t.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
-        r_expand = r.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
-
-        # segments = th.linspace(0, train_sampling_steps, num_segments + 1, device=x_start.device)
-        # segments = th.tensor([0, 499, 999], device=x_start.device)
-        # segments = th.tensor([0, 49], device=x_start.device)
-    
-        # seg_indices = th.searchsorted(segments, t, side="left").clamp(min=1) # .clamp(min=1) prevents the inclusion of 0 in indices.
-        # seg_indices = th.searchsorted(segments, t, side="left").clamp(min=1) - 1
-        # segment_ends = segments[seg_indices]
-        # segment_ends_expand = segment_ends.view(-1, 1, 1, 1).repeat(1, x_start.shape[1], x_start.shape[2], x_start.shape[3])
-
-        # x_at_segment_ends = self.q_sample(x_start, space*segment_ends.to(dtype=th.int), noise=noise)
-        # x_at_segment_ends = []
-        # for segment_end in segment_ends:
-        #     x_at_segment_ends.append(self.q_sample(x_start, th.int(segment_end), noise=noise))
-        # x_at_segment_ends = th.stack(x_at_segment_ends, dim=0)
-
-        # def f_euler(t, segment_ends, xt, vt, train_sampling_steps):
-        #     return xt + ((segment_ends - t) / train_sampling_steps) * vt
-        def f_euler(t, xt, vt, train_sampling_steps):
-            return xt - (t / train_sampling_steps) * vt
-        
-        # def threshold_based_f_euler(t, segment_ends, xt, vt, threshold, x_at_segment_ends, train_sampling_steps):
-        #     if (threshold, int) and threshold == 0:
-        #         return x_at_segment_ends
-            
-        #     # less_than_threshold = t < threshold * train_sampling_steps
-        #     more_than_threshold = t > (1 - threshold) * train_sampling_steps
-            
-        #     # res = (
-        #     #     less_than_threshold * f_euler(t, segment_ends, xt, vt, train_sampling_steps)
-        #     #     + (~less_than_threshold) * x_at_segment_ends
-        #     #     )
-        #     res = (
-        #         more_than_threshold * f_euler(t, segment_ends, xt, vt, train_sampling_steps)
-        #         + (~more_than_threshold) * x_at_segment_ends
-        #         )
-        #     return res
-
-        def threshold_based_f_euler(t, xt, vt, threshold, x_start, train_sampling_steps):
-            if (threshold, int) and threshold == 0:
-                return x_start
-            
-            more_than_threshold = t > (1 - threshold) * train_sampling_steps
-            
-            res = (
-                more_than_threshold * f_euler(t, xt, vt, train_sampling_steps)
-                + (~more_than_threshold) * x_start
-                )
-            return res
-    
-        def cfg_forward(model_fn, latents, t, prev_t, null_y, infer_mask, m_kwargs, cfg_scale, train_sampling_steps):
-            latent_model_input = th.cat([latents] * 2)
-            prompt_embeds = th.cat([null_y, m_kwargs["y"]], dim=0)
-            mo_kwargs = dict(data_info=m_kwargs["data_info"])
-            t_expand = t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3])
-            prev_t_expand = prev_t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3])
-            v_pred = model_fn(latent_model_input, space*th.cat([t] * 2), prompt_embeds, mask=infer_mask, **mo_kwargs)
-            # perform guidance
-            v_pred_uncond, v_pred_text = v_pred.chunk(2)
-            v_pred = v_pred_uncond + cfg_scale * (v_pred_text - v_pred_uncond)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            prev_latents = latents + ((prev_t_expand - t_expand) / train_sampling_steps) * v_pred
-            prev_latents = prev_latents.to(latents_dtype)
-
-            return prev_latents
-
-        terms = {}
-
-        rng_state = th.cuda.get_rng_state()
-        vt = model(x_t, space*t, **model_kwargs)
-        # if isinstance(vt, dict) and vt.get("x", None) is not None:
-        #     vt = vt["x"]
-        # else:
-        #     vt = vt
-        
-        th.cuda.set_rng_state(rng_state) # Shared Dropout Mask
-        with th.no_grad():
-            if (isinstance(boundary, int) and boundary == 0): # when hyperparameter["boundary"] == 0, vr is not needed
-                vr = None
-            else:
-                x_r = cfg_forward(teacher_model, x_t, t, r, null_y, infer_mask, model_kwargs, cfg_scale=4.5, train_sampling_steps=train_sampling_steps)
-                vr = target_model(x_r, space*r, **model_kwargs)
-                # vr = model(x_r, space*r, **model_kwargs)
-                # if isinstance(vr, dict) and vr.get("x", None) is not None:
-                #     vr = vr["x"]
-                # else:
-                #     vr = vr
-                vr = th.nan_to_num(vr)
-
-        # ft = f_euler(t_expand, segment_ends_expand, x_t, vt, train_sampling_steps)
-        # fr = threshold_based_f_euler(r_expand, segment_ends_expand, x_r, vr, boundary, x_at_segment_ends, train_sampling_steps)
-        ft = f_euler(t_expand, x_t, vt, train_sampling_steps)
-        fr = threshold_based_f_euler(r_expand, x_r, vr, boundary, x_start, train_sampling_steps)
-
-        if vae is not None:
-            with th.no_grad():
-                samples_t = vae_decode("dc-ae", vae, ft.to(th.float16))
-                if lpips is not None:
-                    samples_r = vae_decode("dc-ae", vae, fr.to(th.float16))
-                    losses_l = lpips(samples_t, samples_r)
-                    # terms["loss_l"] = lpips(samples_t, samples_r).mean()
-            # samples_t = (
-            #     th.clamp(127.5 * samples_t + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=th.uint8).numpy()[0]
-            # )
-            # image = Image.fromarray(samples_t)
-            # # save image
-            # image.save(f"/data/baotang/sanacfm/tmp/{t}.png")
-
-        ##### loss #####
-        # losses_f = th.square(ft - fr)
-        # losses_f = reduce_op(losses_f.reshape(losses_f.shape[0], -1), dim=-1)
-        # losses_fo = th.square(ft - x_start)
-        # losses_fo = reduce_op(losses_fo.reshape(losses_fo.shape[0], -1), dim=-1)
-        losses_f = huber_loss(ft, fr, delta=0.001, reduce=False)
-        losses_f = reduce_op(losses_f.reshape(losses_f.shape[0], -1), dim=-1)
-
-        if (boundary, int) and boundary == 0:
-            losses_v = 0
-        else:
-            # less_than_threshold = t < boundary * train_sampling_steps
-            # less_than_threshold = less_than_threshold.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
-
-            more_than_threshold = t > (1 - boundary) * train_sampling_steps
-            more_than_threshold = more_than_threshold.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
-
-            # far_from_segment_ends = (segment_ends - t) > 1.01 * delta * train_sampling_steps
-            # far_from_segment_ends = (t - segment_ends) > 1.01 * delta * train_sampling_steps
-            far_from_segment_ends = t > 1.01 * delta * train_sampling_steps
-            far_from_segment_ends = far_from_segment_ends.view(-1, 1, 1, 1).repeat(1, shape[1], shape[2], shape[3])
-        
-            # losses_v = th.square(vt - vr)
-            losses_v = huber_loss(vt, vr, delta=0.001, reduce=False)
-            # losses_v = less_than_threshold * far_from_segment_ends * losses_v
-            losses_v = more_than_threshold * far_from_segment_ends * losses_v
-            losses_v = reduce_op(losses_v.reshape(losses_v.shape[0], -1), dim=-1)
-
-        # v_scale = 1e-5
-        v_scale = 1e-2
-        lpips_scale = 1e-1
-        terms["loss_f"] = th.mean(losses_f)
-        # terms["loss_fo"] = th.mean(losses_fo)
-        terms["loss_v"] = th.mean(v_scale * losses_v)
-        terms["loss_l"] = th.mean(lpips_scale * losses_l)
-        terms["loss"] = th.mean(losses_f + lpips_scale * losses_l)
-
-        return terms
-
     def _get_timesteps(
-        self, num_samples: int = 1, K: int = 1, K_step: int = 1, device="cpu"
+        self, num_samples: int = 1, K: int = 1, device="cpu"
     ):
         # Get the timesteps for the current K
         self.teacher_scheduler.set_timesteps(K)
 
-        # if self.timestep_distribution == "uniform":
-        #     prob = torch.ones(K) / K
-        # elif self.timestep_distribution == "gaussian":
-        #     prob = [torch.exp(-torch.tensor([(i - K / 2) ** 2 / K])) for i in range(K)]
-        #     prob = torch.tensor(prob) / torch.sum(torch.tensor(prob))
-        # elif self.timestep_distribution == "mixture":
-        mixture_num_components = self.mixture_num_components[K_step]
-        mode_probs = self.mode_probs[K_step]
+        mixture_num_components = self.mixture_num_components
+        mode_probs = self.mode_probs
 
         # Define targeted timesteps
         locs = [
             i * (K // mixture_num_components)
             for i in range(0, mixture_num_components)
         ]
-        mixture_var = self.mixture_var[K_step]
+        mixture_var = self.mixture_var
         prob = [
             gaussian_mixture(
                 K,
@@ -1161,35 +951,22 @@ class GaussianDiffusion:
     def addistilling_losses(self, model, teacher_model, dmd_model, discriminator, x_start, train_sampling_steps, 
                             null_y, y, model_kwargs=None, noise=None, skip_noise=False, teacher_data=None):
         space = int(1000 / train_sampling_steps)
-        # assert space == 1
-        # assert train_sampling_steps == 1000
+
         def f_euler(t, xt, vt, train_sampling_steps):
-            # for video
             t_expand = t.view(-1, 1, 1, 1, 1).repeat(1, xt.shape[1], xt.shape[2], xt.shape[3], xt.shape[4])
             return xt - (t_expand / train_sampling_steps) * vt
         def cfg_forward(model_fn, latents, t, null_y, y, m_kwargs, cfg_scale, train_sampling_steps, space, guide_image):
             latent_model_input = th.cat([latents] * 2)
             prompt_embeds = th.cat([null_y, y], dim=0)
-            # mo_kwargs = dict(data_info=m_kwargs["data_info"])
+
             mask = m_kwargs.pop("mask").squeeze(1).squeeze(1)
             t_expand = t.view(-1, 1, 1, 1).repeat(1, latents.shape[1], latents.shape[2], latents.shape[3], latents.shape[4])
             cond_mask_input = th.cat([cond_mask] * 2) if cond_mask is not None else None
-            # v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), prompt_embeds, mask, **mo_kwargs)
+          
             v_pred = model_fn(latent_model_input, space * th.cat([t] * 2), guide_image=guide_image, y=prompt_embeds, cond_mask=cond_mask_input, flow_score=None, mask=mask, **m_kwargs)
             v_pred_uncond, v_pred_text = v_pred.chunk(2)
             v_pred = v_pred_uncond + cfg_scale * (v_pred_text - v_pred_uncond)
-            # noise_pred = latents + (1 - t_expand / train_sampling_steps) * v_pred
-            # perform guidance
-            # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            # noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
 
-            # # compute the previous noisy sample x_t -> x_t-1
-            # latents_dtype = latents.dtype
-            # prev_latents = latents + ((prev_t_expand - t_expand) / train_sampling_steps) * noise_pred
-            # prev_latents = prev_latents.to(latents_dtype)
-
-            # return prev_latents
-            # return noise_pred
             return v_pred
 
         terms = {}
@@ -1199,12 +976,7 @@ class GaussianDiffusion:
         data_info = {}
         data_info["cfg_scale"] = guidance_scale
         self.iter_steps += 1
-        if self.iter_steps > self.K_steps[-1]:
-            K_step = len(self.K) - 1
-        else:
-            K_step = np.argmax(self.iter_steps < self.K_steps)
-        K = self.K[K_step]
-        idx, timestep = self._get_timesteps(num_samples=x_start.shape[0], K=K, K_step=K_step, device=x_start.device)
+        idx, timestep = self._get_timesteps(num_samples=x_start.shape[0], K=self.K, device=x_start.device)
         t = timestep.to(th.int) - 1
 
         if model_kwargs is None:
@@ -1235,48 +1007,6 @@ class GaussianDiffusion:
         ft[:,:,:1,:,:] = th.lerp(ft[:,:,:1,:,:], guide_image, 1.0)
         ft = ft.to(x_start.dtype)
 
-        # # for ltx video teacher
-        # x_t_copy = x_t.clone().detach()
-        # null_t5 = th.load("/data/baotang/sana_videodistill/null_text_feature_t5.pt")
-        # t5_prompt_embeds = teacher_data["text_feat"].squeeze(1).to(x_t.device)
-        # t5_prompt_attention_mask = teacher_data["y_mask"].squeeze(1).to(x_t.device)
-        # null_prompt_embeds = null_t5["text_feat"].repeat(x_t.shape[0], 1, 1).to(t5_prompt_embeds.device)
-        # null_prompt_attention_mask = null_t5["y_mask"].repeat(x_t.shape[0], 1).to(t5_prompt_embeds.device)
-        # teacher_prompt_embeds = th.cat([null_prompt_embeds, t5_prompt_embeds], dim=0)
-        # teacher_prompt_attention_mask = th.cat([null_prompt_attention_mask, t5_prompt_attention_mask], dim=0)
-        # rope_interpolation_scale = (0.32, 32, 32)
-        # x_t_copy = self._pack_latents(x_t_copy)
-        # with th.no_grad():
-        #     for ti in self.teacher_scheduler.timesteps[idx:]:
-        #         latent_model_input = th.cat([x_t_copy] * 2)
-        #         # print(teacher_prompt_embeds.shape)
-        #         # print(teacher_prompt_attention_mask.shape)
-        #         # print(latent_model_input.shape)
-        #         # print(teacher_prompt_embeds.dtype)
-        #         # print(teacher_prompt_attention_mask.dtype)
-        #         # print(latent_model_input.dtype)
-        #         # input()
-        #         timestep_i = th.tensor(ti.expand(latent_model_input.shape[0]), device=x_t.device)
-        #         noise_pred = teacher_model(
-        #             hidden_states=latent_model_input.to(th.float16),
-        #             encoder_hidden_states=teacher_prompt_embeds.to(th.float16),
-        #             timestep=timestep_i,
-        #             # encoder_attention_mask=teacher_prompt_attention_mask.to(th.bool),
-        #             encoder_attention_mask=teacher_prompt_attention_mask,
-        #             num_frames=3,
-        #             height=8,
-        #             width=8,
-        #             rope_interpolation_scale=rope_interpolation_scale,
-        #             attention_kwargs=None,
-        #             return_dict=False,
-        #         )[0].float()
-        #         # print(noise_pred.shape)
-        #         # input()
-        #         v_ti_uncond, v_ti_cond = noise_pred.chunk(2)
-        #         v_ti = v_ti_uncond + guidance_scale * (v_ti_cond - v_ti_uncond)
-        #         x_t_copy = self.teacher_scheduler.step(v_ti, ti, x_t_copy, return_dict=False)[0]
-
-        # teacher_output =self._unpack_latents(x_t_copy, 3, 8, 8)
 
         x_t_copy = x_t.clone().detach()
         with th.no_grad():
@@ -1291,9 +1021,6 @@ class GaussianDiffusion:
                 x_t_copy = x_t_copy.to(x_start.dtype)
         teacher_output = x_t_copy
 
-        # loss_recon = th.square(ft - x_start)
-        # loss_recon = th.mean(loss_recon.reshape(loss_recon.shape[0], -1), dim=-1)
-        # loss_recon = huber_loss(ft, x_start, delta=0.001)
         loss_recon = huber_loss(ft, teacher_output, delta=0.001)
 
         # gan_loss
@@ -1303,7 +1030,7 @@ class GaussianDiffusion:
         prob = th.tensor([0.25, 0.25, 0.25, 0.25])
         idx = prob.multinomial(ft.shape[0], replacement=True).to(ft.device)
         t2 = th.tensor(selected_timesteps, device=ft.device, dtype=th.long)[idx].expand(x_start.shape[0])
-        # noisy_real = self.q_sample(x_start, t2, noise=noise)
+
         noisy_real = self.q_sample(teacher_output, t2, noise=noise)
         noisy_real = noisy_real.to(th.float32)
         noisy_real[:,:,:1,:,:] = th.lerp(noisy_real[:,:,:1,:,:], guide_image, 1.0)
@@ -1331,54 +1058,29 @@ class GaussianDiffusion:
         with th.no_grad():
             v_t = cfg_forward(teacher_model, noisy_student, timestep2, null_y, y,
                                 model_kwargs, cfg_scale=guidance_scale, train_sampling_steps=train_sampling_steps, space=space, guide_image=guide_image)
-            # score_t = -v_t
-            # v_s = dmd_model(noisy_student, space * timestep2, y, **model_kwargs)
-            # score_s = -(noisy_student - (1 + t2_expand / train_sampling_steps) * v_s)
-            # score_s = -v_s
+
             x_0_t = noisy_student + (- t2_expand / train_sampling_steps) * v_t
             score_t = -x_0_t
-        # alpha_prod_t = self.alphas_cumprod.to(device=ft.device, dtype=ft.dtype)[timestep2]
-        # print(self.alphas_cumprod)
-        # print(self.betas_cumprod)
-        # print(self.one_minus_sigmas_cumprod)
-        # print(len(self.one_minus_sigmas_cumprod))
-        # print(self.posterior_mean_coef1)
-        # print(self.posterior_mean_coef2)
-
-        # alpha_prod_t = 1.0 - th.tensor(self.posterior_mean_coef2, device=ft.device, dtype=ft.dtype)[space * timestep2]
-        # beta_prod_t = 1.0 - alpha_prod_t
-        # coeff = ((score_s - score_t) * beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
         
-        # sqrt_alpha_prod_t = th.tensor(self.one_minus_sigmas, device=ft.device, dtype=ft.dtype)[space * timestep2]
-        # sqrt_beta_prod_t = th.tensor(self.sigmas, device=ft.device, dtype=ft.dtype)[space * timestep2]
-        # coeff = ((score_s - score_t) * sqrt_beta_prod_t.view(-1, 1, 1, 1, 1) / sqrt_alpha_prod_t.view(-1, 1, 1, 1, 1))
-
-        # coeff = ((score_s - score_t) * sqrt_beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / sqrt_alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
-
-        # alpha_prod_t = th.tensor(self.alpha_cumprod_aux, device=ft.device, dtype=ft.dtype)[space * timestep2]
-        # beta_prod_t = 1.0 - alpha_prod_t
-        # coeff = ((score_s - score_t) * beta_prod_t.view(-1, 1, 1, 1) ** 0.5 / alpha_prod_t.view(-1, 1, 1, 1) ** 0.5)
 
         coeff = score_t - score_s
         weight = (1.0 / ((ft - x_0_t).abs().mean([1, 2, 3, 4], keepdim=True) + 1e-5).detach())
         loss_dmd = F.mse_loss(ft, (ft - weight * coeff).detach(), reduction="mean")
-        # loss_dmd = F.mse_loss(ft, (ft - weight * coeff), reduction="mean")
+
         loss_dmdmodel = th.mean((target2 - v_s) ** 2)
 
         if self.iter_steps % 2 == 0:
-            loss_dmd = th.tensor(0.0)
-        else: 
-            loss_dmdmodel = th.tensor(0.0)
+            loss_dmd = loss_dmd * 0.0
+        else:
+            loss_dmdmodel = loss_dmdmodel * 0.0
 
-        add_scale = [0.0, 0.05, 0.1, 0.2]
-        dmd_scale = [0.0, 0.3, 0.5, 0.7]
-        terms["loss_dmd"] = dmd_scale[K_step] * loss_dmd
-        terms["loss_dmdmodel"] = dmd_scale[K_step] * loss_dmdmodel
-        terms["loss_G"] = add_scale[K_step] * loss_G
+
+        terms["loss_dmd"] = self.dmd_scale * loss_dmd
+        terms["loss_dmdmodel"] = self.dmd_scale * loss_dmdmodel
+        terms["loss_G"] = self.add_scale * loss_G
         terms["loss_D"] = loss_D
         terms["loss_recon"] = loss_recon
-        # terms["loss"] = terms["loss_G"] + terms["loss_D"] + terms["loss_recon"]
-        # terms["loss"] = terms["loss_recon"] + terms["loss_dmd"] + terms["loss_dmdmodel"]
+
         terms["loss"] = terms["loss_G"] + terms["loss_D"] + terms["loss_recon"] + terms["loss_dmd"] + terms["loss_dmdmodel"]
 
         return terms

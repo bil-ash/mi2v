@@ -75,7 +75,7 @@ def get_tokenizer_and_text_encoder(name="T5", device="cuda"):
         "gemma-2-9b-it": "google/gemma-2-9b-it",
         "Qwen2-0.5B-Instruct": "Qwen/Qwen2-0.5B-Instruct",
         "Qwen2-1.5B-Instruct": "Qwen/Qwen2-1.5B-Instruct",
-        "/data/vepfs/users/shuaizhang/MobileI2V_CAM/model/Qwen2-0.5B": "/data/vepfs/users/shuaizhang/MobileI2V_CAM/model/Qwen2-0.5B",
+        "./model/Qwen2-0.5B": "./model/Qwen2-0.5B",
     }
     assert name in list(text_encoder_dict.keys()), f"not support this text encoder: {name}"
     if "T5" in name:

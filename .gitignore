@@ -21,3 +21,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Model files and logs
+model/
+logs/
+output_flow_2/debug/logs/
