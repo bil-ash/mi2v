@@ -7,7 +7,7 @@
 <h1>MobileI2V: Fast and High-Resolution Image-to-Video on Mobile Devices</h1>
 
 
-[Shuai Zhang](https://github.com/Shuaizhang7)<sup>\*</sup>, [Bao Tang](https://github.com/Tt-DAY)<sup>\*</sup>, Siyuan Yu<sup>\*</sup>, [Yueting Zhu](https://github.com/lazypomeloo), [Jingfeng Yao](https://github.com/JingfengYao),<br>[Ya Zou](https://github.com/ZouYa99), Shanglin Yuan, Li Yu, [Wenyu Liu](http://eic.hust.edu.cn/professor/liuwenyu), [Xinggang Wang](https://xwcv.github.io/index.htm)<sup>📧</sup>
+[Shuai Zhang](https://github.com/Shuaizhang7)<sup>\*</sup>, [Bao Tang](https://github.com/Tt-DAY)<sup>\*</sup>, [Siyuan Yu](https://github.com/siyryu)<sup>\*</sup>, [Yueting Zhu](https://github.com/lazypomeloo), [Jingfeng Yao](https://github.com/JingfengYao),<br>[Ya Zou](https://github.com/ZouYa99), [Shanglin Yuan](https://github.com/ysl6323), Li Yu, [Wenyu Liu](http://eic.hust.edu.cn/professor/liuwenyu), [Xinggang Wang](https://xwcv.github.io/index.htm)<sup>📧</sup>
 
 
 Huazhong University of Science and Technology (HUST) 
