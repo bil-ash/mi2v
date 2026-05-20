@@ -16,7 +16,7 @@ Huazhong University of Science and Technology (HUST)
 
 [![Project](https://img.shields.io/static/v1?label=Project&message=Github&color=blue&logo=github-pages)](https://hustvl.github.io/MobileI2V/)
 [![arxiv paper](https://img.shields.io/badge/arXiv-Paper-red)](https://arxiv.org/abs/2511.21475)
-[![checkpoints](https://img.shields.io/badge/HuggingFace-🤗-green)](https://arxiv.org/abs/2511.21475)
+[![checkpoints](https://img.shields.io/badge/HuggingFace-🤗-green)](https://huggingface.co/hustvl/MobileI2V)
 
 </div>
 
