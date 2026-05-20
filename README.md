@@ -21,7 +21,8 @@ Huazhong University of Science and Technology (HUST)
 </div>
 
 ## 📰 News
-- **[2025.11.27]** We have released our paper on [arXiv](https://arxiv.org/abs/2511.21475).
+- **[2026.05.20]** We open-sourced our [distillation code](https://github.com/hustvl/MobileI2V/tree/distillation).
+- **[2025.11.27]** We have released our paper on [arXiv](https://arxiv.org/abs/2511.21475) and our base model code.
 
 ## 📄 Introduction
 <div align="center">
@@ -93,6 +94,9 @@ Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/tre
 ```
 python scripts/evaluate_FVD.py -dir1 path/gts -dir2 path/videos -b 1 -r 32 -n 128 -ns 16 -i3d ./i3d_torchscript.pt
 ```
+
+### Distillation training
+The training data is consistent with that used for base model training. Please refer to our [distillation code](https://github.com/hustvl/MobileI2V/tree/distillation), which is available in the distillation branch of this repository.
 
 ## 🎯 Mobile Demo
 We designed the mobile UI and deployed the model, as shown in the video below:
