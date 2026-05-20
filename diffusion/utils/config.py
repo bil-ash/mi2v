@@ -56,6 +56,8 @@ class ModelConfig(BaseConfig):
     mixed_precision: str = "fp16"  # ['fp16', 'fp32', 'bf16']
     fp32_attention: bool = True
     load_from: Optional[str] = None
+    teacher_model_path: Optional[str] = None
+    dmd_model_path: Optional[str] = None
     resume_from: Optional[Dict[str, Any]] = field(
         default_factory=lambda: {
             "checkpoint": None,

@@ -20,33 +20,8 @@ Huazhong University of Science and Technology (HUST)
 
 </div>
 
-## 📰 News
-- **[2025.11.27]** We have released our paper on [arXiv](https://arxiv.org/abs/2511.21475).
 
-## 📄 Introduction
-<div align="center">
-<img src="./asset/fig1.png">
-</div>
-Compared with SVD-XT (1.5B), our 5.55× smaller MobileI2V (0.27B) achieves similar generation quality, using only 2.24s on mobile and running 199× faster on an A100 GPU.
 
-## 🎯 Demo
-
-#### (1) 1280×720×17 Image to Video
-<div align="center">
-  <img src="./asset/videos/video1.gif" width="24.5%">
-  <img src="./asset/videos/video2.gif" width="24.5%">
-  <img src="./asset/videos/video3.gif" width="24.5%">
-  <img src="./asset/videos/video4.gif" width="24.5%">
-</div>
-
-#### (2) 960×960×17 Image to Video
-<div align="center">
-  <img src="./asset/videos/video5.gif" width="18.5%">
-  <img src="./asset/videos/video6.gif" width="18.5%">
-  <img src="./asset/videos/video7.gif" width="18.5%">
-  <img src="./asset/videos/video8.gif" width="18.5%">
-
-</div>
 
 
 
@@ -59,47 +34,13 @@ You can install the required environment using the provided requirements.txt fil
 pip install -r requirements.txt
 ```
 ### Data Processing
-There are many open source video datasets, such as [Openvid](https://github.com/NJU-PCALab/OpenVid-1M), [VFHQ](https://liangbinxie.github.io/projects/vfhq/) and [Celebv-text](https://github.com/CelebV-Text/CelebV-Text). The video should be cut into a fixed number of frames (such as 17 or 25...), and the video data should be filtered based on aesthetic (use [DOVER](https://github.com/VQAssessment/DOVER)) and optical flow scores (refer to OpenSora [data Processing](./tools/scoring/README.md)).
+Process the data the same way as the main branch training code.
 
-
-You should organize your processed train data into a CSV file, as shown below:
-
+### Distillation training
+You can use the provided ./train_scripts/train_i2v_distill.sh script for training. The configuration file is located at: ./configs/mobilei2v_config/. Before training, download the weights for [video-vae](https://huggingface.co/Lightricks/LTX-Video/tree/main/vae) and [qwen2-0.5B](https://huggingface.co/Qwen/Qwen2-0.5B/tree/main) and replace the model path in the configuration file.
 ```
-video_path,text,num_frames,height,width,flow
-./_JnC_Zj_P7s_22_0to190_extracted.mp4,scenery,17,720,1080,3.529723644
-./_JnC_Zj_P7s_22_0to190_extracted.mp4,scenery,17,720,1080,4.014187813
+bash ./train_scripts/train_i2v_distill.sh
 ```
-
-### Train
-You can use the provided ./train_scripts/train_i2v.sh script for training. The configuration file is located at: ./configs/mobilei2v_config/. Before training, download the weights for [video-vae](https://huggingface.co/Lightricks/LTX-Video/tree/main/vae) and [qwen2-0.5B](https://huggingface.co/Qwen/Qwen2-0.5B/tree/main) and replace the model path in the configuration file.
-```
-bash ./train_scripts/train_i2v.sh
-```
-
-### Inference
-You can use the provided ./test.sh script for inference. Provide a reference image or video (extract the first frame) to the asset/test.txt file and pass it to the --txt_file parameter.
-```
-CUDA_VISIBLE_DEVICES=0 python scripts/inference_i2v.py \
-      --config=./configs/mobilei2v_config/MobileI2V_300M_img512.yaml \
-      --save_path=humface_1126 \
-      --model_path=./model/hybrid_371.pth \
-      --txt_file=asset/test.txt \
-      --flow_score=2.0 \
-```
-To achieve faster VAE decoder speeds, we replaced the LTX-Video decoder with the [Turbo-VAED](https://github.com/hustvl/Turbo-VAED) decoder.
-
-### Metrics
-Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/tree/main).
-```
-python scripts/evaluate_FVD.py -dir1 path/gts -dir2 path/videos -b 1 -r 32 -n 128 -ns 16 -i3d ./i3d_torchscript.pt
-```
-
-## 🎯 Mobile Demo
-We designed the mobile UI and deployed the model, as shown in the video below:
-<div align="center">
-  <img src="./asset/videos/mobileUI.gif" width="25.5%">
-
-</div>
 
 ## ❤️ Acknowledgements
 

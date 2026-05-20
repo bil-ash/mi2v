@@ -30,6 +30,8 @@ model:
     mixed_precision: fp16
     fp32_attention: true
     load_from: ./model/hybrid_371.pth
+    teacher_model_path: ./model/hybrid_371.pth
+    dmd_model_path: ./model/hybrid_371.pth
     resume_from:
         checkpoint: null
         load_ema: false
@@ -135,47 +137,11 @@ train:
     null_embed_root: output/pretrained_models/
     valid_prompt_embed_root: output/tmp_embed/
     validation_prompts:
-    - The video features a close-up of a man with a weathered and aged appearance.
-        His skin is darkened, possibly due to dirt or a natural skin tone, and he
-        has a full beard and mustache. His eyes are closed, and he appears to be in
-        a state of rest or perhaps exhaustion. The lighting in the scene is dim, with
-        a warm glow that suggests an indoor setting, possibly a room with a low ceiling.
-        The man's expression is one of tranquility or perhaps deep thought. The style
-        of the video is realistic, with a focus on the man's face and the subtle details
-        of his surroundings. The overall mood of the video is contemplative and introspective.
-    - The video features a young man with short brown hair, who is looking to the
-        side with a slight smile on his face. He is wearing a black jacket and a blue
-        shirt. The background is blurred, but it appears to be an outdoor setting
-        with a building and a tree. The style of the video is casual and candid, capturing
-        a moment in the man's life. The focus is on the man's face and expression,
-        with the background serving as a simple backdrop. The lighting is natural,
-        suggesting that the video was taken during the day.
-    - The video features a young woman with long brown hair, who is smiling and looking
-        to the side. The style of the video is a close-up shot, focusing on the woman's
-        face and upper body. The lighting is soft and warm, highlighting the woman's
-        features and creating a pleasant atmosphere. The background is blurred, but
-        it appears to be an indoor setting with curtains and a window. The woman's
-        expression is relaxed and content, suggesting a positive and uplifting mood.
-        The overall style of the video is simple and elegant, with a focus on the
-        woman's beauty and the intimate setting.
-    - The video features a woman with blonde hair, who appears to be in a state of
-        deep thought or sadness. She is wearing a black blazer and has her eyes closed,
-        suggesting she is lost in her thoughts or possibly crying. The background
-        is blurred, but it appears to be an indoor setting with a lamp and a couch,
-        indicating that the scene might be taking place in a living room or a similar
-        space. The overall style of the video is realistic and it seems to capture
-        a candid moment in the woman's life.
-    - The video features a man in a tuxedo, smiling and looking to the side. The man
-        is well-dressed, wearing a black suit with a white shirt and a black bow tie.
-        He has short, light-colored hair and appears to be in a good mood. The background
-        is blurred, but it seems to be an indoor setting, possibly a room with a wooden
-        floor and walls. The lighting is soft and warm, suggesting an indoor environment.
-        The man's expression and attire suggest a formal or celebratory occasion.
-    - This person is talking.
-    - This person is talking1.
-    - This person is talking2.
-    - This person is talking5.
-    - This person is talking10.
+    - test1
+    - test2
+    - test3
+    - test4
+    - test5
     local_save_vis: true
     deterministic_validation: true
     online_metric: false
@@ -191,7 +157,7 @@ train:
     ema_decay: 0.95
     debug_nan: false
     extra: null
-work_dir: output_flow_2/debug
+work_dir: output/debug
 resume_from: null
 load_from: null
 debug: true

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-work_dir=output_flow_2/debug
+work_dir=output/debug
 np=1
 
 

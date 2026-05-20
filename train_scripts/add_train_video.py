@@ -111,27 +111,20 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
         current_image_logs = []
         for prompt in validation_prompts:
             # LTX Video VAE
-            '''
-            z = (
-                torch.randn(1, config.vae.vae_latent_dim, 3, latent_height, latent_width, device=device)
-                if init_z is None
-                else init_z
-            )
-            '''
 
-            if prompt == "The video features a man in a tuxedo, smiling and looking to the side. The man is well-dressed, wearing a black suit with a white shirt and a black bow tie. He has short, light-colored hair and appears to be in a good mood. The background is blurred, but it seems to be an indoor setting, possibly a room with a wooden floor and walls. The lighting is soft and warm, suggesting an indoor environment. The man's expression and attire suggest a formal or celebratory occasion.":
+            if prompt == "test1":
                 ref_image = Image.open("./test_image/test1.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
-            elif prompt == "This person is talking1.":
+            elif prompt == "test2":
                 ref_image = Image.open("./test_image/test2.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([1.0]).to(accelerator.device)
-            elif prompt == "This person is talking2.":
-                ref_image = Image.open("./test_image/test2.jpg").convert("RGB")
-                flow_score = torch.FloatTensor([2.0]).to(accelerator.device)
-            elif prompt == "This person is talking5.":
+            elif prompt == "test3":
                 ref_image = Image.open("./test_image/test3.jpg").convert("RGB")
+                flow_score = torch.FloatTensor([2.0]).to(accelerator.device)
+            elif prompt == "test4":
+                ref_image = Image.open("./test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
-            elif prompt == "This person is talking10.":
+            elif prompt == "test5":
                 ref_image = Image.open("./test_image/test4.jpg").convert("RGB")
                 flow_score = torch.FloatTensor([10.0]).to(accelerator.device)
             else:
@@ -139,7 +132,7 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
                 flow_score = torch.FloatTensor([5.0]).to(accelerator.device)
             transform = transforms.Compose([
                  transforms.ToTensor(),
-                 transforms.Resize([512,512]),
+                 transforms.Resize([config.model.image_height, config.model.image_width]),
                  transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
 
             ])
@@ -159,27 +152,13 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
 
             ref_image = ref_image.float()
             z[:, :, :1, :, :] = torch.lerp(z[:, :, :1, :, :], ref_image, 1.0)
-            # # SANA VAE
-            # z = (
-            #     torch.randn(1, config.vae.vae_latent_dim, config.data.num_frames, latent_size, latent_size, device=device)
-            #     if init_z is None
-            #     else init_z
-            # )
-            # Repeat Noise
-            # z = (
-            #     torch.randn(1, config.vae.vae_latent_dim, 1, latent_size, latent_size, device=device)
-            #     .repeat(1, 1, config.data.num_frames, 1, 1)  # 在 num_frames 维度上重复
-            #     if init_z is None
-            #     else init_z
-            # )
+
             embed = torch.load(
                 osp.join(config.train.valid_prompt_embed_root, f"{prompt[:50]}_{valid_prompt_embed_suffix}"),
                 map_location="cpu",
             )
             caption_embs, emb_masks = embed["caption_embeds"].to(device), embed["emb_mask"].to(device)
-            # caption_embs = caption_embs[:, None]
-            # emb_masks = emb_masks[:, None]
-            # model_kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": ar}, mask=emb_masks)
+
             model_kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": ar, "cfg_scale": torch.tensor(4.5)}, mask=emb_masks)
 
             if sampler == "dpm-solver":
@@ -232,9 +211,7 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
         for prompt, latent in zip(validation_prompts, latents):
             latent = latent.to(torch.float16)
             B, _, D, _, _ = latent.shape
-            # latent = rearrange(latent, "B C D H W -> (B D) C H W")
             samples = vae_decode(config.vae.vae_type, vae, latent)
-            # samples = rearrange(samples, "(B D) C H W -> B C D H W", B=B, D=D)
 
             if not os.path.exists(os.path.join("vis", str(step))):
                 os.makedirs(os.path.join("vis", str(step)))
@@ -422,10 +399,7 @@ def train(config, args, accelerator, model, teacher_model, dmd_model, discrimina
                 optimizer.zero_grad()
                 optimizer_disc.zero_grad()
                 optimizer_dmd.zero_grad()
-                # loss_term = train_diffusion.training_losses(
-                #     # model, clean_images, timesteps, model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
-                #     model, clean_images, timesteps, model_kwargs=dict(y=y, mask=y_mask)
-                # )
+
                 loss_term = train_diffusion.addistilling_losses(
                     model, teacher_model, dmd_model, discriminator, x_start=clean_images, train_sampling_steps=config.scheduler.train_sampling_steps,
                     null_y=null_y, y=y, model_kwargs=dict(mask=y_mask), teacher_data=None
@@ -871,15 +845,6 @@ def main(cfg: SanaConfig) -> None:
         **teacher_model_kwargs,
     ).eval()
 
-    # 异构蒸馏LTX Video Teacher
-    # # quant_config = DiffusersBitsAndBytesConfig(load_in_8bit=True)
-    # teacher_model = LTXVideoTransformer3DModel.from_pretrained(
-    #     "/data/baotang/sana_videodistill/reference/pretrained/LTX-Video",
-    #     subfolder="transformer",
-    #     # quantization_config=quant_config,
-    #     torch_dtype=torch.float16,
-    # ).eval()
-
     dmd_model = build_model(
         config.model.model,
         config.train.grad_checkpointing,
@@ -916,16 +881,13 @@ def main(cfg: SanaConfig) -> None:
 
         # by myself: load teacher or dmd model
         _, _, _, _ = load_checkpoint(
-            # config.model.load_from,
-            # "/data/baotang/sana_videodistill/pretrained/zyt/epoch_136_step_135000.pth",
-            "./model/hybrid_371.pth",
+            getattr(config.model, "teacher_model_path", config.model.load_from),
             teacher_model,
             load_ema=False,
             null_embed_path=null_embed_path,
         )
         _, _, _, _ = load_checkpoint(
-            # config.model.load_from,
-            "./model/hybrid_371.pth",
+            getattr(config.model, "dmd_model_path", config.model.load_from),
             dmd_model,
             load_ema=False,
             null_embed_path=null_embed_path,
@@ -933,9 +895,6 @@ def main(cfg: SanaConfig) -> None:
 
         logger.warning(f"Missing keys: {missing}")
         logger.warning(f"Unexpected keys: {unexpected}")
-
-    # by myself:load discriminator
-    # _,_,_,_ = load_checkpoint("/data/baotang/sanaface/Sanaface_model/add_stage1/discriminator/epoch_104_step_35920.pth", discriminator, null_embed_path=null_embed_path)
 
     # prepare for FSDP clip grad norm calculation
     if accelerator.distributed_type == DistributedType.FSDP:
@@ -950,17 +909,7 @@ def main(cfg: SanaConfig) -> None:
     ]
     num_replicas = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
-    # dataset = data_path(
-    #     asdict(config.data),
-    #     resolution=image_size,
-    #     aspect_ratio_type=config.model.aspect_ratio_type,
-    #     real_prompt_ratio=config.train.real_prompt_ratio,
-    #     max_length=max_length,
-    #     config=config,
-    #     caption_proportion=config.data.caption_proportion,
-    #     sort_dataset=config.data.sort_dataset,
-    #     vae_downsample_rate=config.vae.vae_downsample_rate,
-    # )
+
     print("data_path",config.data.data_path[0])
     dataset = VideoTextDataset(
         transform_name="resize_crop",
