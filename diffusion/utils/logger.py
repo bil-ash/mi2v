@@ -23,10 +23,11 @@ from datetime import datetime
 import numpy as np
 import pytz
 import torch.distributed as dist
-from mmcv.utils.logging import logger_initialized
 from termcolor import colored
 
 from .dist_utils import is_local_master
+
+logger_initialized = {}
 
 
 def get_root_logger(

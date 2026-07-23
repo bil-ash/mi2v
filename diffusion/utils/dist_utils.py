@@ -23,11 +23,13 @@ import os
 import pickle
 import shutil
 
-import mmcv
 import torch
 import torch.distributed as dist
 from accelerate import skip_first_batches
-from mmcv.runner import get_dist_info
+
+
+def get_dist_info():
+    return get_rank(), get_world_size()
 
 
 def is_distributed():
