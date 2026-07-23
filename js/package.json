@@ -1,0 +1,13 @@
+{
+  "name": "mobilei2v-onnx",
+  "private": true,
+  "type": "module",
+  "scripts": { "node": "node src/node-cli.mjs", "check": "node --check src/node-cli.mjs && node --check src/pipeline.mjs && node --check browser/app.mjs" },
+  "dependencies": {
+    "@mmomtchev/ffmpeg": "2.0.1",
+    "@napi-rs/canvas": "0.1.80",
+    "onnxruntime-node": "1.27.0",
+    "onnxruntime-web": "1.27.0",
+    "mediabunny": "1.51.0"
+  }
+}

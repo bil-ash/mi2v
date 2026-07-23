@@ -1,0 +1,18 @@
+MobileI2V CPU PyTorch vs. ONNX Runtime Node.js comparison
+==========================================================
+
+Status: PARTIALLY RUN
+
+The source checkpoints were downloaded to the cloud workspace on 2026-07-23
+using CPU-only PyTorch 2.4.0+cpu and ONNX Runtime 1.27.0.  Turbo-VAED-LTX was
+loaded successfully and its decoder was exported and INT8-QDQ quantized using
+a seeded `[1, 128, 1, 8, 8]` latent smoke input.  The ONNX Runtime QDQ decoder
+produced `[1, 3, 1, 256, 256]` output.
+
+The complete MobileI2V PyTorch and Node.js generation remains NOT RUN: the
+repository's current inference path is CUDA-oriented, and the added JavaScript
+pipeline has not yet been wired to a real MobileI2V model factory/export I/O
+contract.  No full-video comparison or MP4 hash has been fabricated.
+
+Suggested reproducible prompt: "A portrait gently turns toward the camera, natural motion."
+Suggested seed: 1

@@ -636,9 +636,14 @@ class Mobiledit(nn.Module):
         """
 
         B = x.shape[0]
-        x = x.to(self.dtype)
-        timestep = timestep.to(self.dtype)
-        y = y.to(self.dtype)
+        # CPU kernels do not implicitly promote float inputs to half-weight
+        # convolutions (or the reverse).  Derive the activation dtype from the
+        # first projection weight so checkpoint, eager CPU inference, and ONNX
+        # export always use one scalar type.
+        compute_dtype = self.x_embedder.proj.weight.dtype
+        x = x.to(compute_dtype)
+        timestep = timestep.to(compute_dtype)
+        y = y.to(compute_dtype)
         _, _, Tx, Hx, Wx = x.size()
         T, H, W = self.get_dynamic_size(x)
         S = H * W
@@ -664,7 +669,7 @@ class Mobiledit(nn.Module):
         t0 = self.t_block(t)
 
         flow_score = flow_score.unsqueeze(1).repeat(1, 2760)  #768
-        flow_score = self.flow_embedder(flow_score.to(x.dtype))  # (N, D)
+        flow_score = self.flow_embedder(flow_score.to(compute_dtype))  # (N, D)
         flow_score = self.flow_block(flow_score)
 
         y = self.y_embedder(y, self.training)  # (N, 1, L, D)

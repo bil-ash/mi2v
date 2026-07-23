@@ -89,6 +89,50 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_i2v.py \
 ```
 To achieve faster VAE decoder speeds, we replaced the LTX-Video decoder with the [Turbo-VAED](https://github.com/hustvl/Turbo-VAED) decoder.
 
+### CPU ONNX Runtime JavaScript inference
+
+`js/` contains a CPU-only ONNX Runtime 1.27 pipeline for Node.js and a browser
+demo.  It runs the Qwen2-0.5B text model, MobileI2V denoiser, **LTX VAE encoder
+only**, and the Turbo-VAED decoder.  It never loads the LTX decoder.
+
+Install only CPU Python packages and JavaScript dependencies:
+
+```bash
+pip install -r requirements.txt
+cd js && npm install
+```
+
+After placing the verified QDQ models described in [js/MODELS.md](js/MODELS.md)
+in `models/`, generate an MP4 into a result directory with:
+
+```bash
+cd js
+npm run node -- --image ../test_image.png --prompt "A portrait gently turns toward the camera, natural motion." --models ../models --output ../results/node.mp4 --seed 1
+```
+
+The Node encoder uses [`@mmomtchev/ffmpeg`](https://github.com/mmomtchev/ffmpeg)
+to write H.264 MP4. Serve `js/browser/` and `js/models/` from the same origin to
+use the browser UI; its MP4 is written with
+[`mediabunny`](https://github.com/Vanilagy/mediabunny). See
+[`results/onnx_pytorch_comparison.txt`](results/onnx_pytorch_comparison.txt) for
+the reproducibility report and its current verification status.
+
+#### Exporting and validating QDQ models
+
+The CPU-only exporter exports a supplied model factory, performs static INT8-QDQ
+quantization, and fails unless ONNX Runtime's FP32 **and** QDQ output matches
+the original PyTorch result. It writes the model manifest and measured maximum
+errors to `models/validation.json`.
+
+```bash
+python tools/export_mobilei2v_onnx.py --factory your_export_factory:models --output-dir models
+```
+
+The four expected deployable artifacts and the upstream checkpoint/download
+status are documented in [`js/MODELS.md`](js/MODELS.md). The upstream model
+repository currently does not publish the requested quantized ONNX files, so
+this repository intentionally does not claim a nonexistent download URL.
+
 ### Metrics
 Refer to the FVD evaluation script in [vidm](https://github.com/MKFMIKU/vidm/tree/main).
 ```

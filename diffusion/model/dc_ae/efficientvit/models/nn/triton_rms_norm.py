@@ -15,12 +15,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import triton
-import triton.language as tl
 
 __all__ = ["TritonRMSNorm2dFunc"]
 
 
+"""CPU-safe RMSNorm implementation.
+
+The original upstream source unconditionally imported Triton and allocated CUDA
+buffers.  MobileI2V's CPU export path must be importable without a GPU stack,
+so the autograd function below uses equivalent PyTorch operations instead.
+"""
+
+'''
 @triton.jit
 def _rms_norm_2d_fwd_fused(
     X,  # pointer to the input
@@ -205,3 +211,13 @@ class TritonRMSNorm2dFunc(torch.autograd.Function):
         dw = _dw.sum(dim=0)
         db = _db.sum(dim=0)
         return dx, dw, db, None
+'''
+
+
+class TritonRMSNorm2dFunc:
+    """Compatibility shim retaining the upstream call-site API on CPU."""
+
+    @staticmethod
+    def apply(x, weight, bias, eps):
+        rms = torch.rsqrt(x.float().square().mean(dim=1, keepdim=True) + eps).to(x.dtype)
+        return x * rms * weight[None, :, None, None] + bias[None, :, None, None]
